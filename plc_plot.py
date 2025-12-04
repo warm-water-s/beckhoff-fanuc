@@ -26,101 +26,99 @@
             实现了动态 Y 轴调整:根据当前数据的最大值和最小值,自动添加15%的裕量 (PLOT_Y_MARGIN) 来设置 Y 轴范围，防止波形被截断。
         电流趋势图 (update_current_plot)：绘制 A、B、C 三相电流的历史趋势。同样实现了动态 Y 轴调整。
 """
+
+"""
+    ADS 数据采集、动态增量提取与高效保存系统
+    功能：
+    1. 通过 pyads 连接 PLC,读取环形缓冲区数据。
+    2. 实现 PLC 基础 1kHz 采样率,振动 10 个通道交错实现 10kHz 等效采样率的逻辑。
+    3. 动态提取 T_interval (用户设定)时长内的增量数据。
+    4. 实时更新振动和电流的趋势图(使用增量数据更新历史缓存，并绘制滑动窗口).
+    5. 仅保存增量数据到文件。
+"""
 import pyads
 import tkinter
 import time
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.animation import FuncAnimation
 
 # 日志默认条数
 LOG_LINE_NUM = 0
-# 全局PLC连接对象
-Plc = None
+# 全局PLC连接对象 (在 GUI 实例中管理)
 
 # ========== 通道配置 ==========
-TOTAL_CHANNELS = 33              # 总有效通道数 (实际使用)
-VIBRATION_CHANNELS = 30          # 振动通道数（前30个）
-CURRENT_CHANNELS = 3             # 电流通道数（后3个）
-VIBRATION_GROUP_SIZE = 10        # 每10个通道合成一个振动方向 (X, Y, Z)
-SAMPLE_COUNT = 100               # 每个通道采样点数
-SAMPLING_FREQUENCY = 10000       # 采样频率10000Hz
+TOTAL_CHANNELS = 33 # 总有效通道数 (实际使用)
+VIBRATION_CHANNELS = 30 # 振动通道数（前30个）
+CURRENT_CHANNELS = 3 # 电流通道数（后3个）
+VIBRATION_GROUP_SIZE = 10 # 每10个通道合成一个振动方向 (X, Y, Z)
 
-# GVL Buffer 配置 (%MB0: ARRAY[1..8000] OF INT)
-FULL_CHANNELS = 80               # PLC实际分配的通道数
-FULL_BUFFER_LENGTH = FULL_CHANNELS * SAMPLE_COUNT # 80x100 = 8000个INT
-GVL_BUFFER_DATATYPE = pyads.PLCTYPE_INT # 数组元素类型为INT
-GVL_BUFFER_GROUP = 0x4020        # %MB对应的indexgroup
-GVL_BUFFER_OFFSET = 0x0          # %MB0 偏移量
+# 采样率配置 (基于 1kHz 基础采样率和通道组合)
+BASE_SAMPLING_FREQUENCY = 1000 # PLC基础采样频率 1000Hz
+SAMPLE_COUNT = 100 # PLC缓冲区每通道存储的点数 (100ms 窗口)
 
-# GVL Index Buffer 配置 (%MB16000: ARRAY[1..80] OF INT)
-INDEX_BUFFER_OFFSET = 16000      
-INDEX_BUFFER_LENGTH = FULL_CHANNELS # 80个通道的索引
+# 等效采样率
+VIB_SAMPLING_FREQUENCY = BASE_SAMPLING_FREQUENCY * VIBRATION_GROUP_SIZE # 1000 * 10 = 10000 Hz
+CURR_SAMPLING_FREQUENCY = BASE_SAMPLING_FREQUENCY # 1000 Hz
+
+# ADS 配置 (保持不变)
+FULL_CHANNELS = 80 # PLC实际分配的通道数
+FULL_BUFFER_LENGTH = FULL_CHANNELS * SAMPLE_COUNT 
+GVL_BUFFER_DATATYPE = pyads.PLCTYPE_INT 
+GVL_BUFFER_GROUP = 0x4020 
+GVL_BUFFER_OFFSET = 0x0 
+INDEX_BUFFER_OFFSET = 16000 
+INDEX_BUFFER_LENGTH = FULL_CHANNELS 
 INDEX_BUFFER_DATATYPE = pyads.PLCTYPE_INT
 
 # 默认连接参数
 DEFAULT_AMS_NETID = "5.136.192.215.1.1"
 DEFAULT_PORT = "851"
-DEFAULT_INTERVAL_MS = "10" 
+DEFAULT_INTERVAL_MS = "10" # 采集周期/增量时间 T_interval (10ms)
 
 # 绘图配置
-PLOT_HISTORY_LENGTH = 50         # 绘图显示的历史数据周期数（50个采样周期）
-VIB_PLOT_POINTS = 1000           # 振动波形显示点数（10通道×100点）
+PLOT_HISTORY_LENGTH = 50 # 历史窗口长度（周期数）
+VIB_PLOT_POINTS = 10000 # 振动图上显示的总点数 (1000点 / 10kHz = 100ms)
+CURR_PLOT_POINTS = 500 # 电流图上显示的总点数 (500点 / 1kHz = 500ms)
+PLOT_Y_MARGIN = 0.15 # 15% 绘图纵坐标裕量
 
-# 绘图纵坐标裕量 (防止波形贴边或被截断)
-PLOT_Y_MARGIN = 0.15 # 15% 裕量
 
 class GUI():
     def __init__(self, init_windows_name):
         self.init_windows_name = init_windows_name
-        self.save_path = tkinter.StringVar(value="gvl_buffer_data.txt")
-        
-        # 绘图数据缓存
-        self.current_x_data = []                            
-        self.current_y_data = [[] for _ in range(CURRENT_CHANNELS)]
-        
-        self.vib_data = {
-            'X': np.array([]),
-            'Y': np.array([]),
-            'Z': np.array([]),
-            'time': np.array([])
-        }
-        
-        self.sample_index = 0
-        self.ani = None
+        self.save_path = tkinter.StringVar(value="processed_log.txt")
+        self.plc_conn = None
         self.is_realtime_running = False
+        self.sample_index = 0 # 用于电流趋势图的 x 轴点数计数
+        
+        # 振动历史数据缓存 (用于绘制滑动窗口)
+        MAX_VIB_HISTORY_POINTS = PLOT_HISTORY_LENGTH * VIB_PLOT_POINTS
+        self.vib_x_history = [] 
+        self.vib_y_history = []
+        self.vib_z_history = []
+        
+        # 电流历史数据缓存 (用于趋势图绘制)
+        self.current_x_history = [] 
+        self.current_y_history = [[] for _ in range(CURRENT_CHANNELS)]
+        
+        self.set_init_window()
 
     def set_init_window(self):
-        # 窗口基础设置
-        self.init_windows_name.title('ADS 通讯 - 振动电流监测系统 (Frame 隔离布局优化)')
+        """初始化基础UI界面和布局"""
+        self.init_windows_name.title('ADS 通讯 - 振动(10kHz)电流(1kHz)监测系统')
         self.init_windows_name.geometry('1400x800+30+30')
         self.init_windows_name.attributes('-alpha', 0.95)
         
         # ***布局优化：调整 grid 权重***
-        self.init_windows_name.grid_columnconfigure(2, weight=1) # 右侧绘图区可拉伸
+        self.init_windows_name.grid_columnconfigure(2, weight=1) 
+        for i in range(4): self.init_windows_name.grid_rowconfigure(i, weight=1) 
         
-        # 右侧：Row 0-3 均分空间给两个波形图
-        self.init_windows_name.grid_rowconfigure(0, weight=1)   
-        self.init_windows_name.grid_rowconfigure(1, weight=1)   
-        self.init_windows_name.grid_rowconfigure(2, weight=1)   
-        self.init_windows_name.grid_rowconfigure(3, weight=1) 
-        
-        # 1. ========== 左侧：主容器 Frame (隔离行高影响) ==========
+        # 1. ========== 左侧：主容器 Frame ==========
         self.left_frame = tkinter.Frame(self.init_windows_name)
-        # 让 left_frame 跨越主窗口的 Row 0 到 Row 3，占据整个左侧垂直空间
-        # 这样，左侧组件的布局将只由 left_frame 内部的权重控制
         self.left_frame.grid(row=0, column=0, columnspan=2, rowspan=4, padx=10, pady=5, sticky="nsew")
+        self.left_frame.grid_rowconfigure(4, weight=1) 
         
-        # 配置 left_frame 内部的行权重
-        # Row 4 (日志文本框行) 吸收所有剩余空间，将上方的组件推到顶部
-        self.left_frame.grid_rowconfigure(0, weight=0) # ADS 连接
-        self.left_frame.grid_rowconfigure(1, weight=0) # 数据采集
-        self.left_frame.grid_rowconfigure(2, weight=0) # 文件/维护
-        self.left_frame.grid_rowconfigure(3, weight=0) # Log Label
-        self.left_frame.grid_rowconfigure(4, weight=1) # Log Text，**核心：吸收所有垂直剩余空间**
-        
-        # 2. ========== 左侧：操作控制栏 (紧凑排列，父级: left_frame) ==========
+        # 2. ========== 左侧：操作控制栏 ==========
         
         # 2.1. ADS 连接配置组 (Row 0)
         frame_conn = tkinter.LabelFrame(self.left_frame, text="ADS 连接配置", padx=5, pady=5)
@@ -136,7 +134,7 @@ class GUI():
         self.port_text.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
         self.port_text.insert(tkinter.END, DEFAULT_PORT)
         
-        self.open_port_button = tkinter.Button(frame_conn, text='打开端口', command=self.Plc_port_open)
+        self.open_port_button = tkinter.Button(frame_conn, text='打开端口', command=self.plc_port_open)
         self.open_port_button.grid(row=2, column=0, columnspan=2, pady=5, sticky="ew")
         
         # 2.2. 数据采集控制组 (Row 1) 
@@ -172,263 +170,35 @@ class GUI():
         self.delete_all_button.grid(row=1, column=1, pady=5, sticky="ew")
 
         # 2.4. ***系统日志区 (Row 3, 4)***
-        self.ads_communication_log = tkinter.Label(self.left_frame, text='系统日志')
-        # 占据 Row 3
-        self.ads_communication_log.grid(row=3, column=0, columnspan=2, pady=(5, 0), sticky="sw")
-        
+        tkinter.Label(self.left_frame, text='系统日志').grid(row=3, column=0, columnspan=2, pady=(5, 0), sticky="sw")
         self.log_text = tkinter.Text(self.left_frame, width=35, height=10) 
-        # 占据 Row 4，并拉伸
         self.log_text.grid(row=4, column=0, columnspan=2, pady=5, sticky="nsew")
 
 
-        # ========== 右侧：绘图展示主区 (Row 0 - Row 3) ==========
+        # 3. ========== 右侧：绘图展示主区 ==========
         
-        # 振动波形图 (Row 0 - Row 1)
+        # 振动趋势图
         self.fig_vib, self.ax_vib = plt.subplots(figsize=(10, 4), dpi=100)
         self.canvas_vib = FigureCanvasTkAgg(self.fig_vib, master=self.init_windows_name)
-        # 上移到 Row 0，占据两行
         self.canvas_vib.get_tk_widget().grid(row=0, column=2, rowspan=2, padx=10, pady=5, sticky="nsew") 
         
-        # 电流趋势图 (Row 2 - Row 3)
+        # 电流趋势图
         self.fig_current, self.ax_current = plt.subplots(figsize=(10, 4), dpi=100)
         self.canvas_current = FigureCanvasTkAgg(self.fig_current, master=self.init_windows_name)
-        # 紧随振动图下方，占据 Row 2，占据两行
         self.canvas_current.get_tk_widget().grid(row=2, column=2, rowspan=2, padx=10, pady=5, sticky="nsew") 
         
-        # 初始化绘图
         self.init_plots()
 
-    def init_plots(self):
-        """初始化绘图样式"""
-        # 振动波形图初始化 (单张图)
-        self.ax_vib.clear()
-        self.ax_vib.set_title('三方向振动瞬时波形 (X/Y/Z)', fontsize=12)
-        self.ax_vib.set_xlabel('时间 (秒)', fontsize=10)
-        self.ax_vib.set_ylabel('振幅 (INT)', fontsize=10)
-        self.ax_vib.grid(True, alpha=0.3)
-        self.fig_vib.tight_layout()
-        
-        # 电流趋势图初始化
-        self.ax_current.clear()
-        self.ax_current.set_title('三相电流实时波形趋势', fontsize=12)
-        self.ax_current.set_xlabel(f'采样序号 (每周期增加{SAMPLE_COUNT}点)', fontsize=10)
-        self.ax_current.set_ylabel('电流值 (INT)', fontsize=10)
-        self.ax_current.grid(True, alpha=0.3)
-        self.fig_current.tight_layout()
 
-    def update_vibration_plot(self):
-        """更新振动波形图，合并 X/Y/Z 到同一张图，并动态调整纵坐标"""
-        if len(self.vib_data['time']) == 0:
-            return
-        
-        plot_points = min(VIB_PLOT_POINTS, len(self.vib_data['time']))
-        time_slice = self.vib_data['time'][-plot_points:]
-        
-        x_slice = self.vib_data['X'][-plot_points:] if len(self.vib_data['X']) >= plot_points else self.vib_data['X']
-        y_slice = self.vib_data['Y'][-plot_points:] if len(self.vib_data['Y']) >= plot_points else self.vib_data['Y']
-        z_slice = self.vib_data['Z'][-plot_points:] if len(self.vib_data['Z']) >= plot_points else self.vib_data['Z']
-        
-        # ***动态调整纵坐标逻辑***
-        all_vib_data = np.concatenate((x_slice, y_slice, z_slice))
-        if len(all_vib_data) > 0:
-            min_val = np.min(all_vib_data)
-            max_val = np.max(all_vib_data)
-            
-            # 计算裕量
-            range_val = max_val - min_val
-            margin = range_val * PLOT_Y_MARGIN if range_val > 0 else 10 # 最小裕量为10
-            
-            y_min = min_val - margin
-            y_max = max_val + margin
-            
-            # 避免范围过小，例如数据全部为0的情况
-            if y_min == y_max:
-                 y_min -= 50
-                 y_max += 50
-        else:
-            y_min, y_max = -100, 100 # 默认范围
-            
-        self.ax_vib.clear()
-        
-        # 绘制 X/Y/Z 波形
-        self.ax_vib.plot(time_slice, x_slice, color='red', label='X方向', linewidth=1)
-        self.ax_vib.plot(time_slice, y_slice, color='green', label='Y方向', linewidth=1)
-        self.ax_vib.plot(time_slice, z_slice, color='blue', label='Z方向', linewidth=1)
-        
-        self.ax_vib.set_title('三方向振动瞬时波形 (X/Y/Z)', fontsize=12)
-        self.ax_vib.set_xlabel('时间 (秒)', fontsize=10)
-        self.ax_vib.set_ylabel('振幅 (INT)', fontsize=10)
-        self.ax_vib.grid(True, alpha=0.3)
-        self.ax_vib.legend(loc='upper right', fontsize=8) 
-        
-        self.ax_vib.set_ylim(y_min, y_max) # 应用动态纵坐标
-        
-        self.fig_vib.tight_layout()
-        self.canvas_vib.draw()
-
-    def update_current_plot(self):
-        """更新电流波形趋势图，并动态调整纵坐标"""
-        if len(self.current_x_data) == 0:
-            return
-        
-        MAX_POINTS_TO_SHOW = PLOT_HISTORY_LENGTH * SAMPLE_COUNT
-        plot_length = min(MAX_POINTS_TO_SHOW, len(self.current_x_data))
-        x_data = self.current_x_data[-plot_length:]
-        
-        # ***动态调整纵坐标逻辑***
-        all_current_data = []
-        
-        colors = ['red', 'green', 'blue']
-        labels = ['A相电流', 'B相电流', 'C相电流']
-        
-        self.ax_current.clear()
-        
-        for i in range(CURRENT_CHANNELS):
-            if len(self.current_y_data[i]) >= plot_length:
-                y_data = self.current_y_data[i][-plot_length:]
-            else:
-                y_data = self.current_y_data[i]
-            
-            all_current_data.extend(y_data)
-            self.ax_current.plot(x_data, y_data, color=colors[i], label=labels[i], linewidth=1) 
-            
-        if len(all_current_data) > 0:
-            min_val = np.min(all_current_data)
-            max_val = np.max(all_current_data)
-            
-            range_val = max_val - min_val
-            margin = range_val * PLOT_Y_MARGIN if range_val > 0 else 1 # 最小裕量为1
-            
-            y_min = min_val - margin
-            y_max = max_val + margin
-            
-            # 避免范围过小
-            if y_min == y_max:
-                 y_min -= 1
-                 y_max += 1
-        else:
-            y_min, y_max = 0, 1000 # 默认范围
-            
-        self.ax_current.set_title('三相电流实时波形趋势', fontsize=12)
-        self.ax_current.set_xlabel(f'采样序号 (每周期增加{SAMPLE_COUNT}点)', fontsize=10)
-        self.ax_current.set_ylabel('电流值 (INT)', fontsize=10)
-        self.ax_current.grid(True, alpha=0.3)
-        self.ax_current.legend(loc='upper right', fontsize=10)
-        
-        self.ax_current.set_ylim(y_min, y_max) # 应用动态纵坐标
-        
-        self.fig_current.tight_layout()
-        self.canvas_current.draw()
-        
-    def process_data(self, raw_data, index_data):
-        """
-        数据处理：
-        1. 使用 index_data 重组 GvlBuffer，保证时序连续性。
-        2. 分离振动和电流数据。
-        """
-        if raw_data is None or index_data is None:
-            self.write_log_to_text("数据或索引读取失败，跳过处理。")
-            return
-
-        # 1. ========== 环形缓冲区重组 ==========
-        try:
-            raw_matrix = np.array(raw_data, dtype=np.int16).reshape(FULL_CHANNELS, SAMPLE_COUNT)
-            index_array = np.array(index_data, dtype=np.int16)
-        except ValueError as e:
-            self.write_log_to_text(f"数据重塑或索引转换错误: {e}")
-            return
-        
-        continuous_data = np.zeros((TOTAL_CHANNELS, SAMPLE_COUNT), dtype=np.int16)
-        
-        for i in range(TOTAL_CHANNELS): # 只处理前 33 个通道
-            write_ptr = index_array[i] # 写指针标记了缓冲区最新的数据块开头
-            channel_raw = raw_matrix[i, :]
-            
-            # 时序重组：[P, P+1, ..., 100] + [1, 2, ..., P-1]
-            part1 = channel_raw[write_ptr - 1:] 
-            part2 = channel_raw[:write_ptr - 1]
-            continuous_data[i, :] = np.concatenate((part1, part2))
-
-        # 2. ========== 分离和处理振动数据 ==========
-        
-        vib_channels_data = continuous_data[0:VIBRATION_CHANNELS, :]
-        
-        # X/Y/Z 方向是 10 个通道的拼接
-        self.vib_data['X'] = vib_channels_data[0:10, :].flatten()
-        self.vib_data['Y'] = vib_channels_data[10:20, :].flatten()
-        self.vib_data['Z'] = vib_channels_data[20:30, :].flatten()
-
-        # 计算时间轴 (只计算一次)
-        if len(self.vib_data['time']) != len(self.vib_data['X']):
-            total_vib_points = VIBRATION_GROUP_SIZE * SAMPLE_COUNT
-            time_axis = np.arange(total_vib_points) / SAMPLING_FREQUENCY
-            self.vib_data['time'] = time_axis
-        
-        # 3. ========== 处理电流数据（将 100 个点追加）==========
-        
-        current_channels_data = continuous_data[VIBRATION_CHANNELS:, :]
-
-        # 3.1 更新 X 轴数据 (每次增加 100 个点)
-        start_index = self.sample_index + 1
-        end_index = self.sample_index + SAMPLE_COUNT
-        new_x_data = np.arange(start_index, end_index + 1) 
-        self.current_x_data.extend(new_x_data.tolist())
-        self.sample_index = end_index
-
-        # 3.2 更新 Y 轴数据 (将 100 个点追加到每个通道的列表中)
-        for i in range(CURRENT_CHANNELS):
-            channel_data = current_channels_data[i, :]
-            self.current_y_data[i].extend(channel_data.tolist())
-        
-        # 3.3 限制数据长度
-        MAX_POINTS_TO_SHOW = PLOT_HISTORY_LENGTH * SAMPLE_COUNT 
-        
-        if len(self.current_x_data) > MAX_POINTS_TO_SHOW:
-            self.current_x_data = self.current_x_data[-MAX_POINTS_TO_SHOW:]
-            for i in range(CURRENT_CHANNELS):
-                self.current_y_data[i] = self.current_y_data[i][-MAX_POINTS_TO_SHOW:]
-
-    def delete_all_parameter(self):
-        try:
-            self.netID_text.delete(1.0, tkinter.END)
-            self.netID_text.insert(tkinter.END, DEFAULT_AMS_NETID)
-            
-            self.port_text.delete(1.0, tkinter.END)
-            self.port_text.insert(tkinter.END, DEFAULT_PORT)
-            
-            self.interval_text.delete(1.0, tkinter.END)
-            self.interval_text.insert(tkinter.END, DEFAULT_INTERVAL_MS)
-            
-            self.write_log_to_text('清空参数并恢复默认值')
-        except:
-            self.write_log_to_text('清空参数错误')
-
-    def delete_log(self):
-        global LOG_LINE_NUM
-        self.log_text.delete(1.0, tkinter.END)
-        LOG_LINE_NUM = 0
-        self.write_log_to_text('日志已清空')
-
-    def Plc_port_open(self):
-        global Plc
-        AmsNetID = self.netID_text.get(1.0, tkinter.END).strip()
-        port = self.port_text.get(1.0, tkinter.END).strip()
-        try:
-            pyads.open_port() 
-            Plc = pyads.Connection(AmsNetID, int(port))
-            Plc.open()
-            self.write_log_to_text(f'成功连接PLC: {AmsNetID}:{port}')
-        except Exception as e:
-            self.write_log_to_text(f'连接失败: {str(e)}')
-            print(f"连接错误: {e}")
-
+    # --- UI & Log Functions ---
     def get_current_time(self):
         return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
 
     def write_log_to_text(self, logmsg):
+        """将日志写入UI文本框"""
         global LOG_LINE_NUM
         current_time = self.get_current_time()
-        logmsg_in = f"{current_time} {logmsg}\n"
+        logmsg_in = f"[{current_time}] {logmsg}\n"
         
         if LOG_LINE_NUM <= 30:
             self.log_text.insert(tkinter.END, logmsg_in)
@@ -440,104 +210,362 @@ class GUI():
         self.log_text.see(tkinter.END)
         self.log_text.update()
 
-    def read_data_atomic(self):
-        """
-        安全的单次原子读取：
-        同时读取 GvlBuffer (数据, 8000 INT) 和 GvlIndexBuffer (写指针, 80 INT)
-        """
-        global Plc
-        if not Plc or not Plc.is_open:
+    def delete_all_parameter(self):
+        try:
+            self.netID_text.delete(1.0, tkinter.END)
+            self.netID_text.insert(tkinter.END, DEFAULT_AMS_NETID)
+            self.port_text.delete(1.0, tkinter.END)
+            self.port_text.insert(tkinter.END, DEFAULT_PORT)
+            self.interval_text.delete(1.0, tkinter.END)
+            self.interval_text.insert(tkinter.END, DEFAULT_INTERVAL_MS)
+            self.write_log_to_text('清空参数并恢复默认值')
+        except:
+            self.write_log_to_text('清空参数错误')
+
+    def delete_log(self):
+        global LOG_LINE_NUM
+        self.log_text.delete(1.0, tkinter.END)
+        LOG_LINE_NUM = 0
+        self.write_log_to_text('日志已清空')
+
+    # --- PLC Connection & Read ---
+
+    def plc_port_open(self):
+        """打开ADS端口并连接到PLC"""
+        AmsNetID = DEFAULT_AMS_NETID
+        port = int(DEFAULT_PORT)
+        try:
+            AmsNetID = self.netID_text.get(1.0, tkinter.END).strip()
+            port = int(self.port_text.get(1.0, tkinter.END).strip())
+        except:
+             pass # 使用默认值
+        
+        if self.plc_conn and self.plc_conn.is_open:
+            self.write_log_to_text('端口已连接，请勿重复操作。')
+            return
+
+        try:
+            pyads.open_port() 
+            self.plc_conn = pyads.Connection(AmsNetID, port)
+            self.plc_conn.open()
+            self.write_log_to_text(f'成功连接PLC: {AmsNetID}:{port}')
+        except Exception as e:
+            self.write_log_to_text(f'连接失败: {str(e)}')
+            self.plc_conn = None
+
+    def _read_data_atomic(self):
+        """原子读取数据和索引"""
+        if not self.plc_conn or not self.plc_conn.is_open:
             return None, None
 
         try:
-            # 1. 读取整个数据缓冲区 (8000个INT)
-            raw_data = Plc.read(
-                GVL_BUFFER_GROUP, 
-                GVL_BUFFER_OFFSET, 
-                GVL_BUFFER_DATATYPE * FULL_BUFFER_LENGTH
+            raw_data = self.plc_conn.read(
+                GVL_BUFFER_GROUP, GVL_BUFFER_OFFSET, GVL_BUFFER_DATATYPE * FULL_BUFFER_LENGTH
             )
-            
-            # 2. 读取索引缓冲区 (80个INT)
-            index_data = Plc.read(
-                GVL_BUFFER_GROUP,
-                INDEX_BUFFER_OFFSET,
-                INDEX_BUFFER_DATATYPE * INDEX_BUFFER_LENGTH
+            index_data = self.plc_conn.read(
+                GVL_BUFFER_GROUP, INDEX_BUFFER_OFFSET, INDEX_BUFFER_DATATYPE * INDEX_BUFFER_LENGTH
             )
-            
             return raw_data, index_data
-            
         except Exception as e:
             self.write_log_to_text(f'原子读取失败: {str(e)}')
             return None, None
 
-    def read_data_once(self):
-        """单次读取数据"""
-        try:
-            self.write_log_to_text('开始读取振动电流数据...')
-            
-            raw_data, index_data = self.read_data_atomic()
-            if raw_data is None:
-                return
-            
-            self.process_data(raw_data, index_data)
-            
-            self.update_vibration_plot()
-            self.update_current_plot()
-            
-            self.save_data_to_file(raw_data)
-            
-            self.write_log_to_text(f'成功读取{len(raw_data)}个数据点 (已使用索引重组)')
-            self.write_log_to_text('数据已更新到图表并保存')
-            
-        except Exception as e:
-            self.write_log_to_text(f'单次读取失败: {str(e)}')
-            print(f"读取错误: {e}")
+    # --- Data Processing (核心逻辑) ---
 
-    def save_data_to_file(self, raw_data):
-        """保存数据到文件（保存原始PLC内存快照，不进行重组）"""
+    def process_data(self, raw_data, index_data):
+        """
+        数据处理：
+        1. 环形缓冲区重组，获取 100ms 连续波形。
+        2. 振动通道交错重排 (10kHz)。
+        3. 提取增量数据，并更新**绘图历史缓存**。
+        4. 返回增量数据字典供保存。
+        """
+        if raw_data is None or index_data is None:
+            return None, None
+
+        # 获取 T_interval (ms)
+        try:
+            T_interval_ms = float(self.interval_text.get(1.0, tkinter.END).strip() or DEFAULT_INTERVAL_MS)
+        except ValueError:
+            T_interval_ms = float(DEFAULT_INTERVAL_MS)
+        
+        # 1. 计算增量点数
+        N_inc_vib_points = int(T_interval_ms * (VIB_SAMPLING_FREQUENCY / 1000)) # e.g., 10ms * 10 = 100 点
+        N_inc_curr_points = int(T_interval_ms * (CURR_SAMPLING_FREQUENCY / 1000)) # e.g., 10ms * 1 = 10 点
+
+        # --- 环形缓冲区重组 ---
+        try:
+            raw_matrix = np.array(raw_data, dtype=np.int16).reshape(FULL_CHANNELS, SAMPLE_COUNT)
+            index_array = np.array(index_data, dtype=np.int16)
+        except ValueError as e:
+            self.write_log_to_text(f"数据重塑或索引转换错误: {e}")
+            return None, None
+        
+        continuous_data_100ms = np.zeros((TOTAL_CHANNELS, SAMPLE_COUNT), dtype=np.int16)
+        
+        for i in range(TOTAL_CHANNELS):
+            write_ptr = index_array[i] 
+            channel_raw = raw_matrix[i, :]
+            if write_ptr >= SAMPLE_COUNT: write_ptr = SAMPLE_COUNT - 1
+            if write_ptr < 0: write_ptr = 0
+            # 环形缓冲区重组: [P, P+1, ..., 99] + [0, 1, ..., P-1]
+            continuous_data_100ms[i, :] = np.concatenate((channel_raw[write_ptr:], channel_raw[:write_ptr]))
+
+
+        # 2. ========== 振动数据交错重排 (10kHz 连续波形) ==========
+        vib_channels_100ms = continuous_data_100ms[0:VIBRATION_CHANNELS, :]
+        
+        def interleave_vibration(channels_data):
+            """将 10 个 1kHz 通道交错重排成 10kHz 连续波形 (1000点)"""
+            return channels_data.T.flatten()
+
+        vib_x_10ch = vib_channels_100ms[0:10, :] 
+        vib_y_10ch = vib_channels_100ms[10:20, :] 
+        vib_z_10ch = vib_channels_100ms[20:30, :] 
+        
+        vib_x_100ms = interleave_vibration(vib_x_10ch)
+        vib_y_100ms = interleave_vibration(vib_y_10ch)
+        vib_z_100ms = interleave_vibration(vib_z_10ch)
+
+        # 3. ========== 提取和缓存振动增量 (绘图修正的核心) ==========
+        
+        # 提取振动增量 (位于 100ms 波形的末尾)
+        vib_x_inc = vib_x_100ms[-N_inc_vib_points:]
+        vib_y_inc = vib_y_100ms[-N_inc_vib_points:]
+        vib_z_inc = vib_z_100ms[-N_inc_vib_points:]
+
+        # ***更新绘图历史缓存***
+        self.vib_x_history.extend(vib_x_inc.tolist())
+        self.vib_y_history.extend(vib_y_inc.tolist())
+        self.vib_z_history.extend(vib_z_inc.tolist())
+        
+        # 限制历史缓存的长度
+        MAX_VIB_HISTORY_POINTS = PLOT_HISTORY_LENGTH * VIB_PLOT_POINTS
+        if len(self.vib_x_history) > MAX_VIB_HISTORY_POINTS:
+            self.vib_x_history = self.vib_x_history[-MAX_VIB_HISTORY_POINTS:]
+            self.vib_y_history = self.vib_y_history[-MAX_VIB_HISTORY_POINTS:]
+            self.vib_z_history = self.vib_z_history[-MAX_VIB_HISTORY_POINTS:]
+
+
+        # 4. ========== 提取和缓存电流增量 ==========
+        current_channels_100ms = continuous_data_100ms[VIBRATION_CHANNELS:, :]
+        current_channels_inc = current_channels_100ms[:, -N_inc_curr_points:] 
+        
+        # 更新 X 轴数据 (每次增加 N_inc_curr_points 个点)
+        new_x_data = np.arange(self.sample_index + 1, self.sample_index + N_inc_curr_points + 1) 
+        self.current_x_history.extend(new_x_data.tolist())
+        self.sample_index = self.sample_index + N_inc_curr_points
+
+        # 更新 Y 轴数据
+        for i in range(CURRENT_CHANNELS):
+            channel_data = current_channels_inc[i, :]
+            self.current_y_history[i].extend(channel_data.tolist())
+        
+        # 限制电流历史数据长度
+        MAX_CURR_HISTORY_POINTS = PLOT_HISTORY_LENGTH * SAMPLE_COUNT 
+        if len(self.current_x_history) > MAX_CURR_HISTORY_POINTS:
+            self.current_x_history = self.current_x_history[-MAX_CURR_HISTORY_POINTS:]
+            for i in range(CURRENT_CHANNELS):
+                self.current_y_history[i] = self.current_y_history[i][-MAX_CURR_HISTORY_POINTS:]
+
+        # 5. ========== 返回增量数据字典 (用于保存文件) ==========
+        incremental_data = {
+            'Vibration': {
+                'X': vib_x_inc,
+                'Y': vib_y_inc,
+                'Z': vib_z_inc,
+            },
+            'Current': {
+                'A': current_channels_inc[0, :], 
+                'B': current_channels_inc[1, :],
+                'C': current_channels_inc[2, :],
+            },
+            'T_interval_ms': T_interval_ms,
+            'N_inc_vib_points': len(vib_x_inc),
+            'N_inc_curr_points': N_inc_curr_points,
+        }
+
+        return None, incremental_data
+
+    # --- Data Save ---
+
+    def save_data_to_file(self, incremental_data):
+        """只保存增量数据 (T_interval 时长)"""
         filepath = self.save_path.get()
+        timestamp = self.get_current_time()
+        
+        vib_x = incremental_data['Vibration']['X'] 
+        vib_y = incremental_data['Vibration']['Y']
+        vib_z = incremental_data['Vibration']['Z']
+        curr_a = incremental_data['Current']['A'] 
+        curr_b = incremental_data['Current']['B']
+        curr_c = incremental_data['Current']['C']
+        
+        T_interval_ms = incremental_data['T_interval_ms'] 
+        NUM_VIB_POINTS = len(vib_x) 
+        NUM_CURR_POINTS = len(curr_a) 
+        
         try:
-            # 裁剪到实际使用的 3300 个 INT
-            used_raw_data = raw_data[:TOTAL_CHANNELS * SAMPLE_COUNT]
-            
-            vib_raw = used_raw_data[:VIBRATION_CHANNELS * SAMPLE_COUNT]
-            curr_raw = used_raw_data[VIBRATION_CHANNELS * SAMPLE_COUNT:]
-
-            # 振动数据重组 
-            vib_matrix = np.array(vib_raw, dtype=np.int16).reshape(VIBRATION_CHANNELS, SAMPLE_COUNT)
-            vib_channels_data = vib_matrix
-            vib_x = vib_channels_data[0:10, :].flatten()
-            vib_y = vib_channels_data[10:20, :].flatten()
-            vib_z = vib_channels_data[20:30, :].flatten()
-            
-            # 电流数据重组
-            current_matrix = np.array(curr_raw, dtype=np.int16).reshape(CURRENT_CHANNELS, SAMPLE_COUNT)
-            current_matrix = current_matrix.T
-            
             with open(filepath, 'a', encoding='utf-8') as f:
-                f.write(f"\n=== 采集时间: {self.get_current_time()} ===\n")
+                f.write(f"\n=== 采集时间: {timestamp} (增量周期: {T_interval_ms}ms) ===\n")
                 
                 # 写入振动数据
-                # f.write("=== 振动数据（X/Y/Z方向，10通道时序合成，**原始物理存储顺序**）===\n")
-                # f.write("时间(s)\tX振动\tY振动\tZ振动\n")
-                time_axis = np.arange(len(vib_x)) / SAMPLING_FREQUENCY
-                for i in range(len(time_axis)):
-                    f.write(f"{time_axis[i]:.4f}\t{vib_x[i]}\t{vib_y[i]}\t{vib_z[i]}\n")
+                f.write(f"振动增量数据 [等效{VIB_SAMPLING_FREQUENCY}Hz, {NUM_VIB_POINTS}点]\n")
+                f.write("时序序号\t时间(s)\tX振动(INT)\tY振动(INT)\tZ振动(INT)\n")
                 
-                # 写入电流波形数据 (所有100个点)
-                # f.write("\n=== 三相电流数据（100个采样点波形，**原始物理存储顺序**）===\n")
-                # f.write(f"采样序号\tA相电流\tB相电流\tC相电流\n")
-                for j in range(SAMPLE_COUNT):
-                    f.write(f"{j+1}\t{current_matrix[j, 0]}\t{current_matrix[j, 1]}\t{current_matrix[j, 2]}\n")
-
+                time_axis_vib = np.arange(NUM_VIB_POINTS) / VIB_SAMPLING_FREQUENCY
+                for i in range(NUM_VIB_POINTS):
+                    f.write(f"{i+1}\t{time_axis_vib[i]:.4f}\t{vib_x[i]}\t{vib_y[i]}\t{vib_z[i]}\n")
+                
+                # 写入电流波形数据
+                f.write(f"\n电流增量数据 [{CURR_SAMPLING_FREQUENCY}Hz, {NUM_CURR_POINTS}点]\n")
+                f.write(f"采样序号\t时间(s)\tA相电流(INT)\tB相电流(INT)\tC相电流(INT)\n")
+                
+                time_axis_curr = np.arange(NUM_CURR_POINTS) / CURR_SAMPLING_FREQUENCY
+                for j in range(NUM_CURR_POINTS):
+                    f.write(f"{j+1}\t{time_axis_curr[j]:.3f}\t{curr_a[j]}\t{curr_b[j]}\t{curr_c[j]}\n")
+                        
                 f.write('='*80 + '\n')
-                
+            
         except Exception as e:
             self.write_log_to_text(f'文件保存失败: {str(e)}')
 
 
+    # --- Plotting Functions ---
+    def init_plots(self):
+        """初始化绘图样式"""
+        # 振动趋势图初始化 (现在是趋势图)
+        self.ax_vib.clear()
+        self.ax_vib.set_title(f'三方向振动波形趋势 (滑动窗口 {VIB_PLOT_POINTS}点 = 100ms) [{VIB_SAMPLING_FREQUENCY}Hz]', fontsize=12)
+        self.ax_vib.set_xlabel('时间 (秒)', fontsize=10)
+        self.ax_vib.set_ylabel('振幅 (INT)', fontsize=10)
+        self.ax_vib.grid(True, alpha=0.3)
+        self.fig_vib.tight_layout()
+        
+        # 电流趋势图初始化
+        self.ax_current.clear()
+        T_interval_ms = float(self.interval_text.get(1.0, tkinter.END).strip() or DEFAULT_INTERVAL_MS)
+        N_inc_points = int(T_interval_ms * (CURR_SAMPLING_FREQUENCY / 1000)) 
+        self.ax_current.set_title(f'三相电流实时波形趋势 (滑动窗口 {CURR_PLOT_POINTS}点) [{CURR_SAMPLING_FREQUENCY}Hz]', fontsize=12)
+        self.ax_current.set_xlabel(f'采样序号 (每周期增加{N_inc_points}点)', fontsize=10)
+        self.ax_current.set_ylabel('电流值 (INT)', fontsize=10)
+        self.ax_current.grid(True, alpha=0.3)
+        self.fig_current.tight_layout()
+
+    def update_vibration_plot(self):
+        """更新振动波形趋势图，绘制最新的 VIB_PLOT_POINTS 点"""
+        if len(self.vib_x_history) == 0:
+            return
+        
+        plot_length = min(VIB_PLOT_POINTS, len(self.vib_x_history))
+        
+        # 提取滑动窗口数据
+        x_slice = np.array(self.vib_x_history[-plot_length:])
+        y_slice = np.array(self.vib_y_history[-plot_length:])
+        z_slice = np.array(self.vib_z_history[-plot_length:])
+        
+        # 根据采样率创建时间轴
+        time_slice = np.arange(plot_length) / VIB_SAMPLING_FREQUENCY
+        
+        all_vib_data = np.concatenate((x_slice, y_slice, z_slice))
+        if len(all_vib_data) > 0:
+            min_val = np.min(all_vib_data); max_val = np.max(all_vib_data)
+            range_val = max_val - min_val
+            margin = range_val * PLOT_Y_MARGIN if range_val > 0 else 10
+            y_min = min_val - margin; y_max = max_val + margin
+            if y_min == y_max: y_min -= 50; y_max += 50
+        else:
+            y_min, y_max = -100, 100
+            
+        self.ax_vib.clear()
+        
+        # 绘制 X/Y/Z 波形
+        self.ax_vib.plot(time_slice, x_slice, color='red', label='X方向', linewidth=1)
+        self.ax_vib.plot(time_slice, y_slice, color='green', label='Y方向', linewidth=1)
+        self.ax_vib.plot(time_slice, z_slice, color='blue', label='Z方向', linewidth=1)
+        
+        self.ax_vib.set_title(f'三方向振动波形趋势 (滑动窗口 {plot_length}点) [{VIB_SAMPLING_FREQUENCY}Hz]', fontsize=12)
+        self.ax_vib.set_xlabel('时间 (秒)', fontsize=10)
+        self.ax_vib.set_ylabel('振幅 (INT)', fontsize=10)
+        self.ax_vib.grid(True, alpha=0.3)
+        self.ax_vib.legend(loc='upper right', fontsize=8) 
+        
+        self.ax_vib.set_ylim(y_min, y_max)
+        self.fig_vib.tight_layout()
+        self.canvas_vib.draw()
+
+    def update_current_plot(self):
+        """更新电流波形趋势图，绘制最新的 CURR_PLOT_POINTS 点"""
+        if len(self.current_x_history) == 0:
+            return
+        
+        plot_length = min(CURR_PLOT_POINTS, len(self.current_x_history))
+        
+        # 提取滑动窗口数据
+        x_data = self.current_x_history[-plot_length:]
+        
+        T_interval_ms = float(self.interval_text.get(1.0, tkinter.END).strip() or DEFAULT_INTERVAL_MS)
+        N_inc_points = int(T_interval_ms * (CURR_SAMPLING_FREQUENCY / 1000)) 
+        
+        all_current_data = []
+        colors = ['red', 'green', 'blue']
+        labels = ['A相电流', 'B相电流', 'C相电流']
+        
+        self.ax_current.clear()
+        
+        for i in range(CURRENT_CHANNELS):
+            y_data = self.current_y_history[i][-plot_length:]
+            all_current_data.extend(y_data)
+            self.ax_current.plot(x_data, y_data, color=colors[i], label=labels[i], linewidth=1) 
+            
+        if len(all_current_data) > 0:
+            min_val = np.min(all_current_data); max_val = np.max(all_current_data)
+            range_val = max_val - min_val
+            margin = range_val * PLOT_Y_MARGIN if range_val > 0 else 1
+            y_min = min_val - margin; y_max = max_val + margin
+            if y_min == y_max: y_min -= 1; y_max += 1
+        else:
+            y_min, y_max = 0, 1000
+            
+        self.ax_current.set_title(f'三相电流实时波形趋势 (滑动窗口 {plot_length}点) [{CURR_SAMPLING_FREQUENCY}Hz]', fontsize=12)
+        self.ax_current.set_xlabel(f'采样序号 (每周期增加{N_inc_points}点)', fontsize=10)
+        self.ax_current.set_ylabel('电流值 (INT)', fontsize=10)
+        self.ax_current.grid(True, alpha=0.3)
+        self.ax_current.legend(loc='upper right', fontsize=10)
+        
+        self.ax_current.set_ylim(y_min, y_max)
+        self.fig_current.tight_layout()
+        self.canvas_current.draw()
+
+    # --- Realtime Control ---
+
+    def read_data_once(self):
+        """单次读取数据并更新图表和文件"""
+        try:
+            self.write_log_to_text('开始读取振动电流数据...')
+            
+            raw_data, index_data = self._read_data_atomic()
+            if raw_data is None: return
+            
+            # 使用增量处理 (同时更新内部历史缓存)
+            _, incremental_data = self.process_data(raw_data, index_data)
+            
+            if incremental_data is None: return
+
+            self.update_vibration_plot()
+            self.update_current_plot()
+            
+            self.save_data_to_file(incremental_data)
+            
+            self.write_log_to_text(f'成功读取数据点 (振动增量: {incremental_data["N_inc_vib_points"]}点, 电流增量: {incremental_data["N_inc_curr_points"]}点)')
+            self.write_log_to_text('数据已更新到图表并保存')
+            
+        except Exception as e:
+            self.write_log_to_text(f'单次读取失败: {str(e)}')
+
     def start_realtime_monitor(self):
-        if not Plc or not Plc.is_open:
+        """启动实时采集循环"""
+        if not self.plc_conn or not self.plc_conn.is_open:
             self.write_log_to_text('请先打开PLC端口')
             return
 
@@ -549,47 +577,53 @@ class GUI():
         self.realtime_monitor_loop()
 
     def stop_realtime_monitor(self):
+        """停止实时采集循环"""
         self.is_realtime_running = False
         self.realtime_read_button.config(state=tkinter.NORMAL)
         self.stop_read_button.config(state=tkinter.DISABLED)
         self.write_log_to_text('已停止实时监测')
 
     def realtime_monitor_loop(self):
-        """实时监测循环"""
+        """实时采集循环：读取、处理、更新图表、保存"""
         if not self.is_realtime_running:
             return
 
         try:
             interval = int(self.interval_text.get(1.0, tkinter.END).strip())
             
-            raw_data, index_data = self.read_data_atomic()
+            raw_data, index_data = self._read_data_atomic()
             if raw_data is None:
                 self.stop_realtime_monitor() 
                 return
             
-            self.process_data(raw_data, index_data)
+            # 核心：使用增量处理和缓存
+            _, incremental_data = self.process_data(raw_data, index_data)
             
+            if incremental_data is None:
+                return
+            
+            # 更新绘图
             self.update_vibration_plot()
             self.update_current_plot()
             
-            self.save_data_to_file(raw_data)
+            self.save_data_to_file(incremental_data)
             
-            self.write_log_to_text(f'实时监测数据更新完成 (累计采样点: {self.sample_index})')
+            self.write_log_to_text(f'实时监测数据更新完成 (振动增量: {incremental_data["N_inc_vib_points"]}点, 电流增量: {incremental_data["N_inc_curr_points"]}点, 累计采样点: {self.sample_index})')
             
         except Exception as e:
-            self.write_log_to_text(f'实时监测错误: {str(e)}')
+            self.write_log_to_text(f'实时监测循环发生错误: {str(e)}')
         
+        # 安排下一次运行
         if self.is_realtime_running:
             self.init_windows_name.after(interval, self.realtime_monitor_loop)
 
 # 主程序
 def Gui_Start():
-    plt.rcParams['font.sans-serif'] = ['SimHei']  # 支持中文显示
+    plt.rcParams['font.sans-serif'] = ['SimHei'] # 支持中文显示
     plt.rcParams['axes.unicode_minus'] = False
     
     init_window = tkinter.Tk()
     MAIN_Window = GUI(init_window)
-    MAIN_Window.set_init_window()
     init_window.mainloop()
 
 if __name__ == "__main__":
