@@ -1,23 +1,23 @@
 # -*- coding:utf-8 -*-
 """
-ADS 数据采集、动态增量提取与高效保存系统
+ADS 数据采集、双特征工况识别与增量式保存系统
 
 功能：
 1. 实时读取 PLC 环形缓冲区数据。
-2. 将 100ms 完整波形重组 (可用于特征计算)。
-3. 根据用户设置的采集间隔 (T_interval) 动态提取最新的增量数据。
-4. 仅保存 T_interval 增量数据，实现高效存储。
+2. 使用 100ms 完整波形计算 RMS 特征,判断当前工况:STOP, IDLE, CUTTING。
+3. 使用状态机平滑切换，过滤进刀/退刀的过渡数据。
+4. 仅在 CUTTING 状态下，提取最新的 10ms 增量数据进行高效存储。
 
-数据文件(processed_sensor_log.txt)结构 (只保存增量数据)
-    === 采集时间: 2025-12-03 21:00:00 (周期序号: 1) ===
-    振动增量数据 (10ms, 100点)
-    时序序号 X振动(INT) Y振动(INT) Z振动(INT)
-    ... (共 10 * N_inc_points 行振动数据)
+数据文件(processed_sensor_log.txt)结构 (现在只保存 10ms 增量数据)
+    === 采集时间: 2025-12-03 21:00:00 (周期序号: 1) ===
+    振动增量数据 (10ms, 100点)
+    时序序号 X振动(INT) Y振动(INT) Z振动(INT)
+    ... (共 100 行振动数据)
 
-    电流增量数据 (10ms, 10个采样点)
-    采样序号 A相电流(INT) B相电流(INT) C相电流(INT)
-    ... (共 N_inc_points 行电流数据)
-    ===================================================
+    电流增量数据 (10ms, 10个采样点)
+    采样序号 A相电流(INT) B相电流(INT) C相电流(INT)
+    ... (共 10 行电流数据)
+    ===================================================
 """
 import pyads
 import tkinter
@@ -49,6 +49,10 @@ DEFAULT_INTERVAL_MS = "10" # 采集周期/请求间隔 10ms
 DEFAULT_SAVE_PATH = "processed_sensor_log.txt"
 LOG_LINE_NUM = 0
 
+# ========== 工况识别配置 ==========
+DEFAULT_IDLE_THRESHOLD = "50"     # 电流低阈值：区分停转和运行 (原始INT RMS)
+DEFAULT_VIB_THRESHOLD = "2000"    # 振动高阈值：区分空转和切削 (原始INT RMS)
+STABILITY_CHECK_COUNT = 5         # 连续多少个 10ms 周期判断为稳定状态切换 (50ms 延迟)
 # ============================================
 
 class DataLoggerApp:
@@ -57,20 +61,28 @@ class DataLoggerApp:
         self.save_path = tkinter.StringVar(value=DEFAULT_SAVE_PATH)
         self.plc_conn = None
         self.is_realtime_running = False
-        self.sample_index = 0 # 用于记录总采样周期次数
+        self.sample_index = 0 
         
         # 实时数据缓存
-        self.latest_processed_data_100ms = None 
+        self.latest_processed_data = None 
         
+        # 工况识别状态和阈值
+        self.cutting_state = 'STOP'     # 状态: 'STOP', 'IDLE', 'CUTTING'
+        self.state_history = []         # 状态历史记录，用于平滑判断
+        self.stability_check_count = STABILITY_CHECK_COUNT
+        self.idle_threshold = tkinter.StringVar(value=DEFAULT_IDLE_THRESHOLD)
+        self.vib_threshold = tkinter.StringVar(value=DEFAULT_VIB_THRESHOLD)
+        
+
         self.set_init_window()
 
-    # --- UI 初始化与日志功能 (保持不变) ---
+    # --- UI 初始化与日志功能 ---
     def set_init_window(self):
         """初始化基础UI界面"""
-        self.init_windows_name.title('ADS 数据采集与保存系统')
-        self.init_windows_name.geometry('600x450+100+100')
+        self.init_windows_name.title('ADS 数据采集与工况识别系统')
+        self.init_windows_name.geometry('600x600+100+100') 
         self.init_windows_name.grid_columnconfigure(0, weight=1)
-        self.init_windows_name.grid_rowconfigure(4, weight=1)
+        self.init_windows_name.grid_rowconfigure(4, weight=1) 
 
         # 1. ADS 连接配置组 
         frame_conn = tkinter.LabelFrame(self.init_windows_name, text="ADS 连接配置", padx=5, pady=5)
@@ -99,15 +111,29 @@ class DataLoggerApp:
         self.save_path_entry = tkinter.Entry(frame_data, textvariable=self.save_path, width=25)
         self.save_path_entry.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
         
-        self.realtime_read_button = tkinter.Button(frame_data, text='开始实时采集并保存', command=self.start_realtime_monitor)
+        self.realtime_read_button = tkinter.Button(frame_data, text='开始实时采集并识别', command=self.start_realtime_monitor)
         self.realtime_read_button.grid(row=2, column=0, pady=5, sticky="ew")
         
         self.stop_read_button = tkinter.Button(frame_data, text='停止采集', command=self.stop_realtime_monitor, state=tkinter.DISABLED)
         self.stop_read_button.grid(row=2, column=1, pady=5, sticky="ew")
         
         frame_data.grid_columnconfigure(1, weight=1)
+        
+        # 3. 工况识别配置组 
+        frame_threshold = tkinter.LabelFrame(self.init_windows_name, text="工况识别配置 (双特征)", padx=5, pady=5)
+        frame_threshold.grid(row=2, column=0, pady=5, padx=10, sticky="ew")
+        
+        # 电流低阈值：用于区分停转和运行 (基于电流RMS)
+        tkinter.Label(frame_threshold, text='电流停转阈值(低)').grid(row=0, column=0, padx=5, pady=2, sticky="w")
+        tkinter.Entry(frame_threshold, textvariable=self.idle_threshold, width=15).grid(row=0, column=1, padx=5, pady=2, sticky="ew")
+        
+        # 振动高阈值：用于区分空转和切削 (基于振动Z轴RMS)
+        tkinter.Label(frame_threshold, text='振动切削阈值(高)').grid(row=1, column=0, padx=5, pady=2, sticky="w")
+        tkinter.Entry(frame_threshold, textvariable=self.vib_threshold, width=15).grid(row=1, column=1, padx=5, pady=2, sticky="ew")
+        
+        frame_threshold.grid_columnconfigure(1, weight=1)
 
-        # 3. 系统日志区
+        # 4. 系统日志区
         tkinter.Label(self.init_windows_name, text='系统日志').grid(row=3, column=0, pady=(5, 0), padx=10, sticky="sw")
         self.log_text = tkinter.Text(self.init_windows_name, width=60, height=10) 
         self.log_text.grid(row=4, column=0, pady=5, padx=10, sticky="nsew")
@@ -131,7 +157,6 @@ class DataLoggerApp:
             self.log_text.insert(tkinter.END, logmsg_in)
             LOG_LINE_NUM += 1
         else:
-            # 滚动日志
             self.log_text.delete(1.0, 2.0)
             self.log_text.insert(tkinter.END, logmsg_in)
         
@@ -139,9 +164,7 @@ class DataLoggerApp:
         self.log_text.update()
         
     # --- ADS 连接与读写逻辑 (保持不变) ---
-    
     def plc_port_open(self):
-        """打开ADS端口并连接到PLC"""
         AmsNetID = self.netID_text.get(1.0, tkinter.END).strip()
         port = self.port_text.get(1.0, tkinter.END).strip()
         
@@ -159,7 +182,6 @@ class DataLoggerApp:
             self.plc_conn = None
 
     def _read_data_atomic(self):
-        """原子读取数据和索引"""
         if not self.plc_conn or not self.plc_conn.is_open:
             return None, None
 
@@ -179,13 +201,13 @@ class DataLoggerApp:
         """
         数据处理：执行环形缓冲区重组，并分离振动/电流数据。
         返回：
-        1. 完整波形 (100ms) - 可用于特征计算 (processed_data_100ms)
-        2. 增量波形 (T_interval) - 用于高效保存 (incremental_data_dict)
+        1. 完整波形 (100ms) - 用于特征计算
+        2. 增量波形 (T_interval) - 用于高效保存
         """
         if raw_data is None or index_data is None:
             return None, None
 
-        # --- 1. 环形缓冲区重组，获取完整的 100ms 连续波形 ---
+        # --- 1. 环形缓冲区重组，获取完整的 100ms 连续波形 (保持不变) ---
         try:
             raw_matrix = np.array(raw_data, dtype=np.int16).reshape(FULL_CHANNELS, SAMPLE_COUNT)
             index_array = np.array(index_data, dtype=np.int16)
@@ -200,27 +222,15 @@ class DataLoggerApp:
             channel_raw = raw_matrix[i, :]
             
             # 时序重组：[P-1...100] + [0...P-2]
-            # 注意：如果 write_ptr=1，则 [0:] + [:0]，即原样
-            # 如果 write_ptr=100，则 [99:] + [:99]
-            # 由于 PLC 写入的是 P-1，所以 P-1 才是最新的，需要放在末尾
-            part1 = channel_raw[write_ptr:] # 从 write_ptr 开始到末尾 (旧数据)
-            part2 = channel_raw[:write_ptr] # 从开头到 write_ptr (新数据，但时序是 P-1 -> 0)
-            
-            # 正确的重组逻辑应该是让最新写入的点 (index_array[i]-1) 位于末尾，
-            # 确保 continuous_data_100ms[i, :] 是时序连续的 [最旧 ... 最旧-1, ..., 最最新]
-            
-            # 假设 index_array[i] 指向下一个写入位置 (P)，则 P-1 是最新写入的点。
-            # 最新数据是 part2，part1 是旧数据。
-            # continuous_data_100ms = np.concatenate((part2, part1)) 是错误的 (时序不连续)
-            
-            # 根据常见的环形缓冲实现，如果 index_array[i] 是下一个写入位置 P，
-            # 那么当前缓冲区内的连续数据应该是：[P, P+1, ..., 99, 0, 1, ..., P-1]
-            continuous_data_100ms[i, :] = np.concatenate((channel_raw[write_ptr:], channel_raw[:write_ptr]))
+            part1 = channel_raw[write_ptr - 1:] 
+            part2 = channel_raw[:write_ptr - 1]
+            continuous_data_100ms[i, :] = np.concatenate((part1, part2))
 
-        # --- 2. 100ms 完整波形字典 (用于可能需要特征计算) ---
+        # 2. 从完整的 100ms 数据中分离振动和电流 (用于 RMS 特征计算)
         vib_channels_100ms = continuous_data_100ms[0:VIBRATION_CHANNELS, :]
         current_channels_100ms = continuous_data_100ms[VIBRATION_CHANNELS:, :]
         
+        # processed_data_100ms (用于 RMS 计算) 保持不变
         processed_data_100ms = {
             'Vibration': {
                 'X': vib_channels_100ms[0:10, :].flatten(), # 1000 points
@@ -234,7 +244,7 @@ class DataLoggerApp:
             },
         }
 
-        # --- 3. 动态提取增量数据 (T_interval) ---
+        # --- 3. 动态提取增量数据 (N_inc) ---
         
         try:
             # 获取用户配置的采集间隔 (ms)
@@ -243,23 +253,22 @@ class DataLoggerApp:
              # 如果配置出错，退回到 10ms 默认值
             T_interval_ms = float(DEFAULT_INTERVAL_MS)
         
-        # N_inc_points: T_interval_ms 内，每个通道更新的点数 (电流和振动单通道都是 1点/ms)
-        N_inc_points = int(T_interval_ms) 
+        # 电流采样频率 1000Hz (1点/ms)
+        N_inc_curr = int(T_interval_ms) 
         
-        # N_inc_vib_total: 振动总点数（3个方向 x 10个通道/方向 x N_inc_points/通道）
-        # 实际是 3个方向 * (10通道/方向 * 1点/ms) * T_interval_ms，但为了对齐日志结构：
-        N_inc_vib_total = 3 * VIBRATION_GROUP_SIZE * N_inc_points # 30 * N_inc_points
+        # 安全检查，确保 N_inc 不超过 100
+        N_inc_curr = min(N_inc_curr, SAMPLE_COUNT) 
         
-        # 安全检查，确保 N_inc_points 不超过 100
-        N_inc_points = min(N_inc_points, SAMPLE_COUNT) 
-        
-        # 提取增量数据 (位于 continuous_data_100ms 的末尾，末尾是最新数据)
-        current_channels_inc = current_channels_100ms[:, -N_inc_points:] 
-        vib_channels_inc = vib_channels_100ms[:, -N_inc_points:] 
+        # 提取增量数据 (位于 continuous_data_100ms 的末尾)
+        # 提取电流（3相 x N_inc_curr 点）
+        current_channels_inc = current_channels_100ms[:, -N_inc_curr:] 
+        # 提取振动（30通道 x N_inc_curr 点）
+        # 注意：这里 vib_channels_100ms 是 (30 x 100) 矩阵
+        vib_channels_inc = vib_channels_100ms[:, -N_inc_curr:] 
         
         incremental_data_dict = {
             'Vibration': {
-                # X振动: 10通道 * N_inc_points 点
+                # X振动: 10通道 * N_inc_curr 点 = N_inc_vib 点
                 'X': vib_channels_inc[0:10, :].flatten(), 
                 'Y': vib_channels_inc[10:20, :].flatten(),
                 'Z': vib_channels_inc[20:30, :].flatten(),
@@ -269,16 +278,84 @@ class DataLoggerApp:
                 'B': current_channels_inc[1, :],
                 'C': current_channels_inc[2, :],
             },
-            'T_interval_ms': T_interval_ms, # 用于文件保存的描述
-            'N_inc_vib_total': N_inc_vib_total # 用于文件保存时振动点数的描述
+            'T_interval_ms': T_interval_ms # 将增量时长带出，用于文件保存的描述
         }
         
         return processed_data_100ms, incremental_data_dict
 
-    # --- 数据保存逻辑 (只保存增量数据) ---
+    # --- 数据特征计算 (新增) ---
+    def calculate_current_feature(self, current_data):
+        """计算三相电流的平均均方根 (RMS)"""
+        curr_a = current_data['A']
+        curr_b = current_data['B']
+        curr_c = current_data['C']
+        
+        rms_sq_a = np.mean(curr_a.astype(np.float64)**2)
+        rms_sq_b = np.mean(curr_b.astype(np.float64)**2)
+        rms_sq_c = np.mean(curr_c.astype(np.float64)**2)
+        
+        avg_rms = (np.sqrt(rms_sq_a) + np.sqrt(rms_sq_b) + np.sqrt(rms_sq_c)) / 3
+        return avg_rms
 
+    def calculate_vibration_feature(self, vib_data):
+        """计算 Z 轴振动信号的均方根 (RMS) 作为切削特征"""
+        vib_z = vib_data['Z']
+        rms_vib_z = np.sqrt(np.mean(vib_z.astype(np.float64)**2))
+        return rms_vib_z
+    
+    def classify_cutting_state(self, processed_data):
+        """双特征工况识别，使用状态机平滑过渡。"""
+        current_rms_value = self.calculate_current_feature(processed_data['Current'])
+        vib_rms_value = self.calculate_vibration_feature(processed_data['Vibration'])
+
+        try:
+            idle_thresh = float(self.idle_threshold.get())
+            vib_thresh = float(self.vib_threshold.get())
+        except ValueError:
+            self.write_log_to_text('警告: 阈值输入无效，使用默认值。')
+            idle_thresh = float(DEFAULT_IDLE_THRESHOLD)
+            vib_thresh = float(DEFAULT_VIB_THRESHOLD)
+            
+        # 瞬时状态判断 (用于填入历史记录)
+        current_instant_state = 'STOP'
+        if current_rms_value >= idle_thresh:
+            if vib_rms_value >= vib_thresh:
+                current_instant_state = 'CUTTING'
+            else:
+                current_instant_state = 'IDLE'
+
+        # 历史记录和状态平滑 (FSM)
+        self.state_history.append(current_instant_state)
+        if len(self.state_history) > self.stability_check_count:
+            self.state_history.pop(0) 
+            
+        state_counts = {state: self.state_history.count(state) for state in ['STOP', 'IDLE', 'CUTTING']}
+        majority_count = self.stability_check_count
+        
+        # 状态切换逻辑 (要求连续 N 个周期一致)
+        if self.cutting_state != 'CUTTING' and state_counts['CUTTING'] >= majority_count:
+            self.cutting_state = 'CUTTING'
+            self.write_log_to_text(f'>>> ⚠️ **工况切换: CUTTING** ⚠️ (Vib RMS: {vib_rms_value:.2f})')
+        elif self.cutting_state == 'CUTTING' and state_counts['IDLE'] >= majority_count:
+            self.cutting_state = 'IDLE'
+            self.write_log_to_text(f'>>> ✅ **工况切换: IDLE** ✅ (Vib RMS: {vib_rms_value:.2f})')
+        elif state_counts['STOP'] >= majority_count:
+            if self.cutting_state != 'STOP':
+                self.cutting_state = 'STOP'
+                self.write_log_to_text(f'>>> 🛑 **工况切换: STOP** 🛑 (Curr RMS: {current_rms_value:.2f})')
+        elif state_counts['IDLE'] >= majority_count:
+            self.cutting_state = 'IDLE'
+            
+        return self.cutting_state 
+
+    def send_data_to_model(self, processed_data):
+        """占位函数：在这里将 processed_data 传入您的后续模型 (建议传入 100ms 完整波形)"""
+        # TODO: 请根据您的模型接口修改此函数。
+        pass 
+        
+    # --- 数据保存逻辑 (只保存增量数据) ---
     def save_processed_data_to_file(self, incremental_data):
-        """只保存增量数据 (T_interval 时长)"""
+        """保存增量数据 (T_interval 时长)"""
         filepath = self.save_path.get()
         timestamp = self.get_current_time()
         
@@ -287,10 +364,10 @@ class DataLoggerApp:
         vib_z = incremental_data['Vibration']['Z']
         curr_a = incremental_data['Current']['A'] 
         
-        T_interval_ms = incremental_data['T_interval_ms'] 
+        T_interval_ms = incremental_data['T_interval_ms'] # 获取增量时长
         
-        # 根据增量数据字典中携带的信息获取点数
-        NUM_VIB_POINTS = len(vib_x) 
+        # 根据增量数据计算点数
+        NUM_VIB_POINTS = len(vib_x) # 10 * N_inc_curr
         NUM_CURR_POINTS = len(curr_a) 
         
         try:
@@ -321,7 +398,6 @@ class DataLoggerApp:
 
     # --- 实时监测控制 ---
     def start_realtime_monitor(self):
-        """启动实时采集循环"""
         if not self.plc_conn or not self.plc_conn.is_open:
             self.write_log_to_text('请先打开PLC端口')
             return
@@ -329,50 +405,64 @@ class DataLoggerApp:
         self.is_realtime_running = True
         self.realtime_read_button.config(state=tkinter.DISABLED)
         self.stop_read_button.config(state=tkinter.NORMAL)
-        self.write_log_to_text('开始实时采集并保存增量数据...')
+        self.write_log_to_text('开始实时采集并识别工况...')
         
         self.realtime_monitor_loop()
 
     def stop_realtime_monitor(self):
-        """停止实时采集循环"""
         self.is_realtime_running = False
         self.realtime_read_button.config(state=tkinter.NORMAL)
         self.stop_read_button.config(state=tkinter.DISABLED)
         self.write_log_to_text('已停止实时采集')
 
     def realtime_monitor_loop(self):
-        """实时采集循环：读取、处理、保存"""
+        """实时采集循环：读取、处理、识别、保存"""
         if not self.is_realtime_running:
             return
 
         try:
+            # 1. 获取采集间隔
             interval = int(self.interval_text.get(1.0, tkinter.END).strip())
             
-            # 1. 读取数据
+            # 2. 读取数据
             raw_data, index_data = self._read_data_atomic()
             if raw_data is None:
+                # 读取失败，停止循环
                 self.stop_realtime_monitor() 
                 return
             
-            # 2. 处理数据: 获取 100ms 完整波形 和 T_interval 增量波形
+            # 3. 处理数据 (返回 100ms 完整波形用于特征计算, 和 T_interval 增量波形用于保存)
+            # incremental_data_dict 现在包含 T_interval_ms，用于动态调整增量大小
             processed_data_100ms, incremental_data_dict = self.process_data(raw_data, index_data)
             
             if processed_data_100ms and incremental_data_dict:
                 self.sample_index += 1
-                self.latest_processed_data_100ms = processed_data_100ms # 缓存最新的完整波形
+                self.latest_processed_data = processed_data_100ms
                 
-                # 3. 核心：只保存增量数据
-                saved = self.save_processed_data_to_file(incremental_data_dict)
+                # 4. 工况识别 (基于 100ms 完整波形计算的特征)
+                current_state = self.classify_cutting_state(processed_data_100ms)
                 
-                if saved:
-                    log_msg = f'数据更新完成 (周期 {self.sample_index}). **[增量数据已保存 ({incremental_data_dict["T_interval_ms"]}ms)]**'
-                else:
-                    log_msg = f'数据处理完成，但文件保存失败 (周期 {self.sample_index})'
+                log_msg = f'数据更新完成 (周期 {self.sample_index}). 状态: **{current_state}**'
+                
+                # 5. 核心数据划分逻辑：只保存 CUTTING 状态的增量数据
+                if current_state == 'CUTTING':
+                    # 使用动态提取的增量数据进行保存
+                    saved = self.save_processed_data_to_file(incremental_data_dict)
                     
+                    # 将 100ms 完整波形数据传入模型 (如果需要)
+                    self.send_data_to_model(processed_data_100ms) 
+                    
+                    if saved:
+                        log_msg += ' **[增量切削数据已保存并送入模型]**'
+                    else:
+                        log_msg += ' **[增量切削数据保存失败]**'
+                else:
+                    log_msg += ' [非切削数据已跳过处理]'
+
                 self.write_log_to_text(log_msg)
             
         except ValueError:
-            self.write_log_to_text('错误：采集间隔输入无效，请检查。')
+            self.write_log_to_text('错误：采集间隔或阈值输入无效，请检查。')
         except Exception as e:
             self.write_log_to_text(f'实时监测循环发生错误: {str(e)}')
         
