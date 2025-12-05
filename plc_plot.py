@@ -27,14 +27,19 @@
         电流趋势图 (update_current_plot)：绘制 A、B、C 三相电流的历史趋势。同样实现了动态 Y 轴调整。
 """
 
+# -*- coding:utf-8 -*-
 """
     ADS 数据采集、动态增量提取与高效保存系统
     功能：
     1. 通过 pyads 连接 PLC,读取环形缓冲区数据。
     2. 实现 PLC 基础 1kHz 采样率,振动 10 个通道交错实现 10kHz 等效采样率的逻辑。
     3. 动态提取 T_interval (用户设定)时长内的增量数据。
-    4. 实时更新振动和电流的趋势图(使用增量数据更新历史缓存，并绘制滑动窗口).
+    4. 实时更新振动和电流的趋势图(使用增量数据更新历史缓存，并绘制滑动窗口)。
     5. 仅保存增量数据到文件。
+    
+    主要优化点:
+    - 历史缓存点数计算逻辑修正: 确保 MAX_HISTORY_POINTS 对应 PLOT_HISTORY_LENGTH * (每周期实际采集点数)。
+    - 代码结构优化: 将 MAX_HISTORY_POINTS 等基于配置的参数在 __init__ 中计算。
 """
 import pyads
 import tkinter
@@ -45,9 +50,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # 日志默认条数
 LOG_LINE_NUM = 0
-# 全局PLC连接对象 (在 GUI 实例中管理)
 
-# ========== 通道配置 ==========
+# ========== 通道与采样配置 (常量) ==========
 TOTAL_CHANNELS = 33 # 总有效通道数 (实际使用)
 VIBRATION_CHANNELS = 30 # 振动通道数（前30个）
 CURRENT_CHANNELS = 3 # 电流通道数（后3个）
@@ -61,7 +65,7 @@ SAMPLE_COUNT = 100 # PLC缓冲区每通道存储的点数 (100ms 窗口)
 VIB_SAMPLING_FREQUENCY = BASE_SAMPLING_FREQUENCY * VIBRATION_GROUP_SIZE # 1000 * 10 = 10000 Hz
 CURR_SAMPLING_FREQUENCY = BASE_SAMPLING_FREQUENCY # 1000 Hz
 
-# ADS 配置 (保持不变)
+# ADS 配置 (PLC内存配置)
 FULL_CHANNELS = 80 # PLC实际分配的通道数
 FULL_BUFFER_LENGTH = FULL_CHANNELS * SAMPLE_COUNT 
 GVL_BUFFER_DATATYPE = pyads.PLCTYPE_INT 
@@ -74,12 +78,13 @@ INDEX_BUFFER_DATATYPE = pyads.PLCTYPE_INT
 # 默认连接参数
 DEFAULT_AMS_NETID = "5.136.192.215.1.1"
 DEFAULT_PORT = "851"
-DEFAULT_INTERVAL_MS = "10" # 采集周期/增量时间 T_interval (10ms)
+DEFAULT_INTERVAL_MS = "10" # 采集周期/增量时间 T_interval
 
-# 绘图配置
-PLOT_HISTORY_LENGTH = 50 # 历史窗口长度（周期数）
-VIB_PLOT_POINTS = 10000 # 振动图上显示的总点数 (1000点 / 10kHz = 100ms)
-CURR_PLOT_POINTS = 500 # 电流图上显示的总点数 (500点 / 1kHz = 500ms)
+# 绘图配置 (历史点数, 对应 1s 窗口, 历史缓存长度)
+# 注意: PLOT_HISTORY_LENGTH 决定了历史缓存的总长度（非显示长度）
+VIB_PLOT_POINTS = VIB_SAMPLING_FREQUENCY * 1 # 10000 Hz * 1s = 10000 点 (振动波形显示窗口宽度 1s)
+CURR_PLOT_POINTS = CURR_SAMPLING_FREQUENCY * 1 # 1000 Hz * 1s = 1000 点 (电流趋势图显示窗口宽度 1s)
+PLOT_HISTORY_LENGTH = 110 # 历史缓存周期数 (110 * 100ms = 11s)
 PLOT_Y_MARGIN = 0.15 # 15% 绘图纵坐标裕量
 
 
@@ -89,15 +94,21 @@ class GUI():
         self.save_path = tkinter.StringVar(value="processed_log.txt")
         self.plc_conn = None
         self.is_realtime_running = False
-        self.sample_index = 0 # 用于电流趋势图的 x 轴点数计数
+        self.sample_index = 0 # 用于电流趋势图的 x 轴点数计数 (累计)
         
-        # 振动历史数据缓存 (用于绘制滑动窗口)
-        MAX_VIB_HISTORY_POINTS = PLOT_HISTORY_LENGTH * VIB_PLOT_POINTS
+        # 修正历史缓存点数计算 (核心修正)
+        # 历史缓存点数 = PLOT_HISTORY_LENGTH * (每周期实际采集点数)
+        
+        # 振动历史数据缓存: 每周期 (100ms) 采集 10 个 1kHz 通道 = 1000 点
+        # MAX_VIB_HISTORY_POINTS = 周期数 * 1000 点
+        self.MAX_VIB_HISTORY_POINTS = PLOT_HISTORY_LENGTH * VIBRATION_GROUP_SIZE * SAMPLE_COUNT 
         self.vib_x_history = [] 
         self.vib_y_history = []
         self.vib_z_history = []
         
-        # 电流历史数据缓存 (用于趋势图绘制)
+        # 电流历史数据缓存: 每周期 (100ms) 采集 1 个 1kHz 通道 = 100 点
+        # MAX_CURR_HISTORY_POINTS = 周期数 * 100 点
+        self.MAX_CURR_HISTORY_POINTS = PLOT_HISTORY_LENGTH * SAMPLE_COUNT 
         self.current_x_history = [] 
         self.current_y_history = [[] for _ in range(CURRENT_CHANNELS)]
         
@@ -118,21 +129,20 @@ class GUI():
         self.left_frame.grid(row=0, column=0, columnspan=2, rowspan=4, padx=10, pady=5, sticky="nsew")
         self.left_frame.grid_rowconfigure(4, weight=1) 
         
-        # 2. ========== 左侧：操作控制栏 ==========
+        # 2. ========== 左侧：操作控制栏 (简化结构) ==========
         
         # 2.1. ADS 连接配置组 (Row 0)
         frame_conn = tkinter.LabelFrame(self.left_frame, text="ADS 连接配置", padx=5, pady=5)
         frame_conn.grid(row=0, column=0, columnspan=2, pady=5, sticky="ew")
         
+        # 使用 Entry 代替 Text for single line input
         tkinter.Label(frame_conn, text='AmsNetID').grid(row=0, column=0, padx=5, pady=2, sticky="w")
-        self.netID_text = tkinter.Text(frame_conn, width=20, height=1)
-        self.netID_text.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
-        self.netID_text.insert(tkinter.END, DEFAULT_AMS_NETID)
+        self.netID_var = tkinter.StringVar(value=DEFAULT_AMS_NETID)
+        tkinter.Entry(frame_conn, textvariable=self.netID_var, width=25).grid(row=0, column=1, padx=5, pady=2, sticky="ew")
         
         tkinter.Label(frame_conn, text='Port').grid(row=1, column=0, padx=5, pady=2, sticky="w")
-        self.port_text = tkinter.Text(frame_conn, width=20, height=1)
-        self.port_text.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
-        self.port_text.insert(tkinter.END, DEFAULT_PORT)
+        self.port_var = tkinter.StringVar(value=DEFAULT_PORT)
+        tkinter.Entry(frame_conn, textvariable=self.port_var, width=25).grid(row=1, column=1, padx=5, pady=2, sticky="ew")
         
         self.open_port_button = tkinter.Button(frame_conn, text='打开端口', command=self.plc_port_open)
         self.open_port_button.grid(row=2, column=0, columnspan=2, pady=5, sticky="ew")
@@ -142,9 +152,8 @@ class GUI():
         frame_data.grid(row=1, column=0, columnspan=2, pady=5, sticky="ew") 
         
         tkinter.Label(frame_data, text='读取间隔(ms)').grid(row=0, column=0, padx=5, pady=2, sticky="w")
-        self.interval_text = tkinter.Text(frame_data, width=15, height=1)
-        self.interval_text.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
-        self.interval_text.insert(tkinter.END, DEFAULT_INTERVAL_MS)
+        self.interval_var = tkinter.StringVar(value=DEFAULT_INTERVAL_MS)
+        tkinter.Entry(frame_data, textvariable=self.interval_var, width=25).grid(row=0, column=1, padx=5, pady=2, sticky="ew")
         
         self.read_data_button = tkinter.Button(frame_data, text='读取数据 (单次)', command=self.read_data_once)
         self.read_data_button.grid(row=1, column=0, columnspan=2, pady=5, sticky="ew")
@@ -166,7 +175,7 @@ class GUI():
         self.delete_log_button = tkinter.Button(frame_file, text='清空日志', command=self.delete_log)
         self.delete_log_button.grid(row=1, column=0, pady=5, sticky="ew")
         
-        self.delete_all_button = tkinter.Button(frame_file, text='清空参数', command=self.delete_all_parameter)
+        self.delete_all_button = tkinter.Button(frame_file, text='重置连接参数', command=self.reset_parameters)
         self.delete_all_button.grid(row=1, column=1, pady=5, sticky="ew")
 
         # 2.4. ***系统日志区 (Row 3, 4)***
@@ -210,19 +219,18 @@ class GUI():
         self.log_text.see(tkinter.END)
         self.log_text.update()
 
-    def delete_all_parameter(self):
+    def reset_parameters(self):
+        """重置连接和采集参数"""
         try:
-            self.netID_text.delete(1.0, tkinter.END)
-            self.netID_text.insert(tkinter.END, DEFAULT_AMS_NETID)
-            self.port_text.delete(1.0, tkinter.END)
-            self.port_text.insert(tkinter.END, DEFAULT_PORT)
-            self.interval_text.delete(1.0, tkinter.END)
-            self.interval_text.insert(tkinter.END, DEFAULT_INTERVAL_MS)
-            self.write_log_to_text('清空参数并恢复默认值')
-        except:
-            self.write_log_to_text('清空参数错误')
+            self.netID_var.set(DEFAULT_AMS_NETID)
+            self.port_var.set(DEFAULT_PORT)
+            self.interval_var.set(DEFAULT_INTERVAL_MS)
+            self.write_log_to_text('连接参数已重置为默认值')
+        except Exception as e:
+            self.write_log_to_text(f'重置参数错误: {e}')
 
     def delete_log(self):
+        """清空日志"""
         global LOG_LINE_NUM
         self.log_text.delete(1.0, tkinter.END)
         LOG_LINE_NUM = 0
@@ -232,13 +240,12 @@ class GUI():
 
     def plc_port_open(self):
         """打开ADS端口并连接到PLC"""
-        AmsNetID = DEFAULT_AMS_NETID
-        port = int(DEFAULT_PORT)
+        AmsNetID = self.netID_var.get().strip()
         try:
-            AmsNetID = self.netID_text.get(1.0, tkinter.END).strip()
-            port = int(self.port_text.get(1.0, tkinter.END).strip())
-        except:
-             pass # 使用默认值
+            port = int(self.port_var.get().strip())
+        except ValueError:
+            self.write_log_to_text('端口号无效，请检查输入。')
+            return
         
         if self.plc_conn and self.plc_conn.is_open:
             self.write_log_to_text('端口已连接，请勿重复操作。')
@@ -285,13 +292,17 @@ class GUI():
 
         # 获取 T_interval (ms)
         try:
-            T_interval_ms = float(self.interval_text.get(1.0, tkinter.END).strip() or DEFAULT_INTERVAL_MS)
+            T_interval_ms = float(self.interval_var.get().strip())
         except ValueError:
             T_interval_ms = float(DEFAULT_INTERVAL_MS)
+            
+        # 1. 计算增量点数 (确保增量点数是整数)
+        N_inc_vib_points = int(round(T_interval_ms * (VIB_SAMPLING_FREQUENCY / 1000))) 
+        N_inc_curr_points = int(round(T_interval_ms * (CURR_SAMPLING_FREQUENCY / 1000)))
         
-        # 1. 计算增量点数
-        N_inc_vib_points = int(T_interval_ms * (VIB_SAMPLING_FREQUENCY / 1000)) # e.g., 10ms * 10 = 100 点
-        N_inc_curr_points = int(T_interval_ms * (CURR_SAMPLING_FREQUENCY / 1000)) # e.g., 10ms * 1 = 10 点
+        # 边界检查: 确保采集点数不大于 100ms 的 PLC 周期点数
+        N_inc_vib_points = min(N_inc_vib_points, VIBRATION_GROUP_SIZE * SAMPLE_COUNT) # 1000点
+        N_inc_curr_points = min(N_inc_curr_points, SAMPLE_COUNT) # 100点
 
         # --- 环形缓冲区重组 ---
         try:
@@ -306,9 +317,11 @@ class GUI():
         for i in range(TOTAL_CHANNELS):
             write_ptr = index_array[i] 
             channel_raw = raw_matrix[i, :]
+            # 确保指针在合法范围内
             if write_ptr >= SAMPLE_COUNT: write_ptr = SAMPLE_COUNT - 1
             if write_ptr < 0: write_ptr = 0
-            # 环形缓冲区重组: [P, P+1, ..., 99] + [0, 1, ..., P-1]
+            
+            # 环形缓冲区重组: [P, P+1, ..., 99] + [0, 1, ..., P-1] (确保时序连续)
             continuous_data_100ms[i, :] = np.concatenate((channel_raw[write_ptr:], channel_raw[:write_ptr]))
 
 
@@ -317,6 +330,7 @@ class GUI():
         
         def interleave_vibration(channels_data):
             """将 10 个 1kHz 通道交错重排成 10kHz 连续波形 (1000点)"""
+            # (10通道, 100点) -> (100点, 10通道) -> 扁平化 (1000点)
             return channels_data.T.flatten()
 
         vib_x_10ch = vib_channels_100ms[0:10, :] 
@@ -327,7 +341,7 @@ class GUI():
         vib_y_100ms = interleave_vibration(vib_y_10ch)
         vib_z_100ms = interleave_vibration(vib_z_10ch)
 
-        # 3. ========== 提取和缓存振动增量 (绘图修正的核心) ==========
+        # 3. ========== 提取和缓存振动增量 ==========
         
         # 提取振动增量 (位于 100ms 波形的末尾)
         vib_x_inc = vib_x_100ms[-N_inc_vib_points:]
@@ -340,11 +354,10 @@ class GUI():
         self.vib_z_history.extend(vib_z_inc.tolist())
         
         # 限制历史缓存的长度
-        MAX_VIB_HISTORY_POINTS = PLOT_HISTORY_LENGTH * VIB_PLOT_POINTS
-        if len(self.vib_x_history) > MAX_VIB_HISTORY_POINTS:
-            self.vib_x_history = self.vib_x_history[-MAX_VIB_HISTORY_POINTS:]
-            self.vib_y_history = self.vib_y_history[-MAX_VIB_HISTORY_POINTS:]
-            self.vib_z_history = self.vib_z_history[-MAX_VIB_HISTORY_POINTS:]
+        if len(self.vib_x_history) > self.MAX_VIB_HISTORY_POINTS:
+            self.vib_x_history = self.vib_x_history[-self.MAX_VIB_HISTORY_POINTS:]
+            self.vib_y_history = self.vib_y_history[-self.MAX_VIB_HISTORY_POINTS:]
+            self.vib_z_history = self.vib_z_history[-self.MAX_VIB_HISTORY_POINTS:]
 
 
         # 4. ========== 提取和缓存电流增量 ==========
@@ -354,7 +367,7 @@ class GUI():
         # 更新 X 轴数据 (每次增加 N_inc_curr_points 个点)
         new_x_data = np.arange(self.sample_index + 1, self.sample_index + N_inc_curr_points + 1) 
         self.current_x_history.extend(new_x_data.tolist())
-        self.sample_index = self.sample_index + N_inc_curr_points
+        self.sample_index = self.sample_index + N_inc_curr_points # 累计采样点数更新
 
         # 更新 Y 轴数据
         for i in range(CURRENT_CHANNELS):
@@ -362,11 +375,10 @@ class GUI():
             self.current_y_history[i].extend(channel_data.tolist())
         
         # 限制电流历史数据长度
-        MAX_CURR_HISTORY_POINTS = PLOT_HISTORY_LENGTH * SAMPLE_COUNT 
-        if len(self.current_x_history) > MAX_CURR_HISTORY_POINTS:
-            self.current_x_history = self.current_x_history[-MAX_CURR_HISTORY_POINTS:]
+        if len(self.current_x_history) > self.MAX_CURR_HISTORY_POINTS:
+            self.current_x_history = self.current_x_history[-self.MAX_CURR_HISTORY_POINTS:]
             for i in range(CURRENT_CHANNELS):
-                self.current_y_history[i] = self.current_y_history[i][-MAX_CURR_HISTORY_POINTS:]
+                self.current_y_history[i] = self.current_y_history[i][-self.MAX_CURR_HISTORY_POINTS:]
 
         # 5. ========== 返回增量数据字典 (用于保存文件) ==========
         incremental_data = {
@@ -385,7 +397,8 @@ class GUI():
             'N_inc_curr_points': N_inc_curr_points,
         }
 
-        return None, incremental_data
+        # process_data 返回处理结果和增量数据, 这里的 None 保持原意, 增量数据用于文件保存
+        return None, incremental_data 
 
     # --- Data Save ---
 
@@ -394,6 +407,7 @@ class GUI():
         filepath = self.save_path.get()
         timestamp = self.get_current_time()
         
+        # ... (数据提取和计算部分不变, 逻辑清晰)
         vib_x = incremental_data['Vibration']['X'] 
         vib_y = incremental_data['Vibration']['Y']
         vib_z = incremental_data['Vibration']['Z']
@@ -434,9 +448,9 @@ class GUI():
     # --- Plotting Functions ---
     def init_plots(self):
         """初始化绘图样式"""
-        # 振动趋势图初始化 (现在是趋势图)
+        # 振动趋势图初始化
         self.ax_vib.clear()
-        self.ax_vib.set_title(f'三方向振动波形趋势 (滑动窗口 {VIB_PLOT_POINTS}点 = 100ms) [{VIB_SAMPLING_FREQUENCY}Hz]', fontsize=12)
+        self.ax_vib.set_title(f'三方向振动波形 (滑动窗口 {VIB_PLOT_POINTS}点/1s) [{VIB_SAMPLING_FREQUENCY}Hz]', fontsize=12)
         self.ax_vib.set_xlabel('时间 (秒)', fontsize=10)
         self.ax_vib.set_ylabel('振幅 (INT)', fontsize=10)
         self.ax_vib.grid(True, alpha=0.3)
@@ -444,10 +458,15 @@ class GUI():
         
         # 电流趋势图初始化
         self.ax_current.clear()
-        T_interval_ms = float(self.interval_text.get(1.0, tkinter.END).strip() or DEFAULT_INTERVAL_MS)
-        N_inc_points = int(T_interval_ms * (CURR_SAMPLING_FREQUENCY / 1000)) 
-        self.ax_current.set_title(f'三相电流实时波形趋势 (滑动窗口 {CURR_PLOT_POINTS}点) [{CURR_SAMPLING_FREQUENCY}Hz]', fontsize=12)
-        self.ax_current.set_xlabel(f'采样序号 (每周期增加{N_inc_points}点)', fontsize=10)
+        
+        try:
+            T_interval_ms = float(self.interval_var.get().strip())
+        except ValueError:
+            T_interval_ms = float(DEFAULT_INTERVAL_MS)
+        
+        N_inc_points = int(round(T_interval_ms * (CURR_SAMPLING_FREQUENCY / 1000))) 
+        self.ax_current.set_title(f'三相电流实时趋势 (滑动窗口 {CURR_PLOT_POINTS}点/1s) [{CURR_SAMPLING_FREQUENCY}Hz]', fontsize=12)
+        self.ax_current.set_xlabel(f'采样序号 (每次更新{N_inc_points}点)', fontsize=10)
         self.ax_current.set_ylabel('电流值 (INT)', fontsize=10)
         self.ax_current.grid(True, alpha=0.3)
         self.fig_current.tight_layout()
@@ -465,8 +484,9 @@ class GUI():
         z_slice = np.array(self.vib_z_history[-plot_length:])
         
         # 根据采样率创建时间轴
-        time_slice = np.arange(plot_length) / VIB_SAMPLING_FREQUENCY
+        time_slice = np.arange(len(x_slice)) / VIB_SAMPLING_FREQUENCY
         
+        # ... (动态 Y 轴调整逻辑不变)
         all_vib_data = np.concatenate((x_slice, y_slice, z_slice))
         if len(all_vib_data) > 0:
             min_val = np.min(all_vib_data); max_val = np.max(all_vib_data)
@@ -484,7 +504,7 @@ class GUI():
         self.ax_vib.plot(time_slice, y_slice, color='green', label='Y方向', linewidth=1)
         self.ax_vib.plot(time_slice, z_slice, color='blue', label='Z方向', linewidth=1)
         
-        self.ax_vib.set_title(f'三方向振动波形趋势 (滑动窗口 {plot_length}点) [{VIB_SAMPLING_FREQUENCY}Hz]', fontsize=12)
+        self.ax_vib.set_title(f'三方向振动波形 (滑动窗口 {plot_length}点) [{VIB_SAMPLING_FREQUENCY}Hz]', fontsize=12)
         self.ax_vib.set_xlabel('时间 (秒)', fontsize=10)
         self.ax_vib.set_ylabel('振幅 (INT)', fontsize=10)
         self.ax_vib.grid(True, alpha=0.3)
@@ -504,8 +524,13 @@ class GUI():
         # 提取滑动窗口数据
         x_data = self.current_x_history[-plot_length:]
         
-        T_interval_ms = float(self.interval_text.get(1.0, tkinter.END).strip() or DEFAULT_INTERVAL_MS)
-        N_inc_points = int(T_interval_ms * (CURR_SAMPLING_FREQUENCY / 1000)) 
+        # 更新标题中的增量点数
+        try:
+            T_interval_ms = float(self.interval_var.get().strip())
+        except ValueError:
+            T_interval_ms = float(DEFAULT_INTERVAL_MS)
+        
+        N_inc_points = int(round(T_interval_ms * (CURR_SAMPLING_FREQUENCY / 1000))) 
         
         all_current_data = []
         colors = ['red', 'green', 'blue']
@@ -518,6 +543,7 @@ class GUI():
             all_current_data.extend(y_data)
             self.ax_current.plot(x_data, y_data, color=colors[i], label=labels[i], linewidth=1) 
             
+        # ... (动态 Y 轴调整逻辑不变)
         if len(all_current_data) > 0:
             min_val = np.min(all_current_data); max_val = np.max(all_current_data)
             range_val = max_val - min_val
@@ -527,8 +553,8 @@ class GUI():
         else:
             y_min, y_max = 0, 1000
             
-        self.ax_current.set_title(f'三相电流实时波形趋势 (滑动窗口 {plot_length}点) [{CURR_SAMPLING_FREQUENCY}Hz]', fontsize=12)
-        self.ax_current.set_xlabel(f'采样序号 (每周期增加{N_inc_points}点)', fontsize=10)
+        self.ax_current.set_title(f'三相电流实时趋势 (滑动窗口 {plot_length}点) [{CURR_SAMPLING_FREQUENCY}Hz]', fontsize=12)
+        self.ax_current.set_xlabel(f'采样序号 (每次更新{N_inc_points}点)', fontsize=10)
         self.ax_current.set_ylabel('电流值 (INT)', fontsize=10)
         self.ax_current.grid(True, alpha=0.3)
         self.ax_current.legend(loc='upper right', fontsize=10)
@@ -589,7 +615,15 @@ class GUI():
             return
 
         try:
-            interval = int(self.interval_text.get(1.0, tkinter.END).strip())
+            # 确保 interval 是一个有效的整数
+            try:
+                interval = int(self.interval_var.get().strip())
+                if interval <= 0:
+                    interval = int(DEFAULT_INTERVAL_MS)
+                    self.write_log_to_text('读取间隔必须大于0，已恢复默认值。')
+            except ValueError:
+                interval = int(DEFAULT_INTERVAL_MS)
+                self.write_log_to_text('读取间隔输入无效，已恢复默认值。')
             
             raw_data, index_data = self._read_data_atomic()
             if raw_data is None:
@@ -608,10 +642,14 @@ class GUI():
             
             self.save_data_to_file(incremental_data)
             
-            self.write_log_to_text(f'实时监测数据更新完成 (振动增量: {incremental_data["N_inc_vib_points"]}点, 电流增量: {incremental_data["N_inc_curr_points"]}点, 累计采样点: {self.sample_index})')
+            # 优化日志输出频率 (避免日志过多影响性能)
+            # 仅在需要时输出，或者限制输出频率
+            if self.sample_index % (10 * incremental_data["N_inc_curr_points"]) == 0: # 比如每 10 次增量更新打印一次
+                 self.write_log_to_text(f'实时监测数据更新完成 (振动增量: {incremental_data["N_inc_vib_points"]}点, 电流增量: {incremental_data["N_inc_curr_points"]}点, 累计采样点: {self.sample_index})')
             
         except Exception as e:
             self.write_log_to_text(f'实时监测循环发生错误: {str(e)}')
+            self.stop_realtime_monitor() # 发生错误时停止循环
         
         # 安排下一次运行
         if self.is_realtime_running:
