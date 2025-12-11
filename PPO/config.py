@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+
 # import seaborn as sns
 import os
 import numpy as np
@@ -24,24 +25,24 @@ class Config:
         self.mode = "train"  # train or test
         self.seed = 1  # 随机种子
         self.device = "cuda" if torch.cuda.is_available() else "cpu"  # device to use
-        self.train_eps = 800  # 训练的回合数
+        self.train_eps = 3000  # 训练的回合数
         self.test_eps = 50  # 测试的回合数
-        self.max_steps = 500  # 每个回合的最大步数
+        self.max_steps = 400  # 每个回合的最大步数
         self.eval_eps = 5  # 评估的回合数
         self.eval_per_episode = 10  # 评估的频率
 
         self.gamma = 0.99  # 折扣因子
         self.k_epochs = 10  # 更新策略网络的次数
-        self.actor_lr = 3e-4  # actor网络的学习率
+        self.actor_lr = 1e-4  # actor网络的学习率
         self.critic_lr = 3e-4  # critic网络的学习率
         self.eps_clip = 0.2  # epsilon-clip
-        self.entropy_coef = 0.03  # entropy的系数
-        self.update_freq = 100  # 更新频率
-        self.actor_hidden_dim = 256  # actor网络的隐藏层维度
-        self.critic_hidden_dim = 256  # critic网络的隐藏层维度
+        self.entropy_coef = 0.1  # entropy的系数
+        self.update_freq = 4096  # 更新频率
+        self.actor_hidden_dim = 512  # actor网络的隐藏层维度
+        self.critic_hidden_dim = 512  # critic网络的隐藏层维度
         self.checkpoint_dir = "./save_path/"
         self.lam = 0.95  # GAE的参数
-        self.batch_size = 1024  # 批大小
+        self.batch_size = 512  # 批大小
 
 
 def env_agent_config(cfg, MAT_FOLDER):
@@ -53,21 +54,19 @@ def env_agent_config(cfg, MAT_FOLDER):
         mat_path = os.path.join(MAT_FOLDER, "leafmap_3D2.mat")
     else:
         mat_path = MAT_FOLDER
-        
+
     print(f"Loading environment with MAT file: {mat_path}")
-    
 
     # 加载不同的铣削环境
     # env = Milling_env(MAT_FOLDER) # ppo
     # env = Milling_env_1125(MAT_FOLDER) # ppo_1125
-    env = Milling_env_1211(mat_path) # ppo_1211
-
+    env = Milling_env_1211(mat_path, max_steps=cfg.max_steps)  # ppo_1211
 
     # env = MillingSLDEnv() # env2
     # env = MillingEnvLobe3(MAT_FOLDER)
     # env = Milling_env(MAT_FOLDER)
 
-    # all_seed(env, seed=cfg.seed)
+    all_seed(env, seed=cfg.seed)
     n_states = 4  # 状态空间维度
     n_actions = 1  # 动作空间维度
     print(f"状态空间维度：{n_states}，动作空间维度：{n_actions}")
@@ -97,7 +96,7 @@ def plot_rewards(rewards, cfg, tag="train"):
     plt.figure()  # 创建一个图形实例，方便同时多画几个图
     plt.title(f"{tag}ing curve on {cfg.device} of {cfg.algo_name} for {cfg.env_name}")
     plt.xlabel("epsiodes")
-    plt.plot(rewards, label="rewards")
+    plt.plot(rewards, label="rewards", alpha=0.2, color="gray")
     plt.plot(smooth(rewards), label="smoothed")
     plt.legend()
 

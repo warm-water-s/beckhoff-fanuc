@@ -7,7 +7,7 @@ cfg = Config()
 # 训练
 # train_env, agent = env_agent_config(cfg, "./StabilityLobeData_3D.mat")
 # train_env, agent = env_agent_config(cfg, "./train_mat_files") # env_ppo
-train_env, agent = env_agent_config(cfg,"./train_mat_files")
+train_env, agent = env_agent_config(cfg, "./train_mat_files")
 
 
 best_agent, res_dic = train(cfg, train_env, agent)
