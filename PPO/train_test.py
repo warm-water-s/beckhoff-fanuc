@@ -24,7 +24,7 @@ def train(cfg, env, agent):
             ep_step += 1
             action, log_prob = agent.sample_action(state)  # 选择动作
             # 更新环境，返回transition
-            next_state, reward, done = env.step(state, action)
+            next_state, reward, done = env.step(state,action)
 
             agent.memory.push((state, action, log_prob, reward, done))  # 保存transition
             state = next_state  # 更新下一个状态
@@ -93,7 +93,7 @@ def test(cfg, env, agent):
                 print(f"action:{action}\t ap:{state[0]:.5f}\t n:{state[2]:.5f}")
             state = next_state  # 更新下一个状态
             ep_reward += reward  # 累加奖励
-            if done:
+            if done:    
                 break
         steps.append(ep_step)
         rewards.append(ep_reward)

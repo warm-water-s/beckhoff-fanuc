@@ -49,7 +49,7 @@ class MillingSLDEnv():
         self.step_scale = np.array([
             0.1 * (self.n_max - self.n_min),  # 转速步长
             0.1 * (self.ap_max - self.ap_min) # 切深步长
-        ], dtype=np.float32)
+        ], dtype=np.float32) # type: ignore
 
         self.reset()
 

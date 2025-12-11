@@ -4,9 +4,7 @@
             每个回合随机选择一个mat文件,在固定ap、ae和fz的情况下寻找最优的n
             状态参数为: ap ae n fz freq
             动作参数为: n
-        针对不同的叶瓣图文件(训练集中)可以顺利找到边界,对于未见过的频率无法很好的找到边界
-            推断原因:每个叶瓣图实际上只是在找固定切深下的那个转速点,学习到的策略可能是在特定频率下的一个值,策略并没有理解边界
-              对于没有见过的频率对应的叶瓣图,策略不知道那个点在哪里
+
 """
 
 import numpy as np
@@ -146,12 +144,15 @@ def linear_normalize(x, original_min, original_max):
     """将原始值线性归一化到0~1"""
     return (x - original_min) / (original_max - original_min)
 
-class Milling_env:
+class Milling_env_1125:
     def __init__(self, mat_folder_path):
         self.checker = StabilityChecker(mat_folder_path)
-        # 使用checker中的频率范围
+        # 使用checker中的频率范围,用于频率归一化
         self.freq_min = self.checker.freq_min
         self.freq_max = self.checker.freq_max
+        # 记录上一次状态的稳定性
+        self.last_stable = True  # 初始化
+        self.last_n_real = None
 
     def reset(self):
         # 重置铣削环境
@@ -160,14 +161,12 @@ class Milling_env:
         ap = 0.5
         ae = 0.5  # 将切宽0~4mm归一化到0~1之间  2mm
         n = random.random()  # 将转速1000~10000r/min归一化到0~1之间
-        # fz = random.random()  # 每齿进给量归一化到0~1之间,对应的真实值×2
         fz = 0.1
 
         current_freq = self.checker.current_frequency
         freq_normalized = linear_normalize(current_freq, self.freq_min, self.freq_max)
 
         state = np.array([ap, ae, n, fz,freq_normalized])
-
         return state
 
     # 计算新的工艺参数
@@ -183,34 +182,62 @@ class Milling_env:
         f_next = state[3]
         return np.array([ap_next, ae_next, n_next, f_next,state[4]])
 
-    def calculate_boundary_value(self, state, action):
-        # 计算给定动作和状态的价值
-        ap, ae, n, fz, _ = state
-        # 计算给定动作和状态的奖励
-        # ap_real = linear_denormalize(ap, 0, 2)
-        ap_real = 1
-        ae_real = ae * 4  # 2mm
-        value = 0
-        n_real = int(linear_denormalize(n, 6500, 8500))
-        # n_real = 5500
-        fz_real = fz * 2  # 0.2mm
-        done = False
-        MRR = ap_real * n_real  # 10~20000范围
-        MRR = np.log10(MRR + 1)  # type: ignore # 对数归一化
-        value += MRR - 0.1 * np.abs(np.mean(action))
-        stable = self.checker.is_action_stable(n_real, ap_real)
-        max_depth = self.checker.get_max_depth(n_real)
-        if stable == False:  # 如果在叶瓣图之外，则不稳定
-            value -= 100
-            done = True
+    def calculate_boundary_value(self,state,action):
+        """
+            计算执行该动作的奖励，并决定是否真正执行（通过返回 next_state）
+            返回: (next_state, reward)
+        """
+        # 1. 计算 tentative 下一状态
+        tentative_next_state = self.update_parameters(state, action)
+
+        # 2. 反归一化用于稳定性检查
+        ap_real = 1 # 固定
+        ae_real = tentative_next_state[1] * 4.0  # 2mm
+        n_real = int(linear_denormalize(tentative_next_state[2], 6500, 8500))
+        fz_real = tentative_next_state[3] * 0.2 # 假设 [0,1] -> [0,0.2]
+
+
+        # 3. 检查稳定性（注意：checker 应支持输入真实物理值）
+        is_stable = self.checker.is_action_stable(n_real, ap_real)
+
+        # 4. 获取上一次的稳定性（用于判断是否刚越界）
+        was_stable = self.last_stable
+
+        reward = 0.0
+
+        if not is_stable:
+            # 不稳定：强惩罚
+            reward = -100.0
+            next_state = tentative_next_state  # 允许进入，但惩罚
+
         else:
-            r = np.exp(-2 * (max_depth - ap_real))  # type: ignore # 指数衰减，d=0->r=1;d=2->r=0.018
-            # r = 1
-            value += r * 3
-        return value
+             # 稳定：给予基础奖励
+            MRR = ap_real * ae_real * n_real * fz_real  # 更合理的材料去除率公式
+            MRR_norm = np.log10(MRR + 1)
+            reward = MRR_norm - 0.1 * np.abs(np.mean(action))
+
+            # === 关键：如果上一步不稳定，现在稳定了 → 说明退回边界内，奖励不高
+            #     如果上一步稳定，现在也稳定 → 看是否在“试探边界”
+            
+            # 如果之前是稳定的，且这次动作很小（精细调整），说明在边界附近徘徊
+            if was_stable:
+                action_magnitude = np.abs(action).mean()
+                if action_magnitude < 0.05:  # 小动作阈值（对应 Δn < ~100 rpm）
+                    reward += 2.0  # 鼓励在边界附近微调
+
+            # 可选：如果刚刚从不稳定恢复，轻微惩罚（避免震荡）
+            if not was_stable:
+                reward -= 1.0
+
+            next_state = tentative_next_state
+
+        # 更新历史信息
+        self.last_stable = is_stable
+        self.last_n_real = n_real
+
+        return next_state, reward
 
     def step(self, state, action):
-        state_next = self.update_parameters(state, action)
-        value = self.calculate_boundary_value(state_next, action)
+        state_next,value = self.calculate_boundary_value(state,action)
         done = False
         return state_next, value, done

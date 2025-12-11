@@ -1,5 +1,5 @@
 import matplotlib.pyplot as plt
-import seaborn as sns
+# import seaborn as sns
 import os
 import numpy as np
 import torch
@@ -8,6 +8,7 @@ from PPO_Model.PPO import Agent, AgentGaussian
 
 
 from envs.milling_env_ppo import Milling_env
+from envs.milling_env_ppo_1125 import Milling_env_1125
 
 # from envs.env2 import MillingSLDEnv
 # from envs.env_three_lobe import MillingEnvLobe3
@@ -22,7 +23,7 @@ class Config:
         self.mode = "train"  # train or test
         self.seed = 1  # 随机种子
         self.device = "cuda" if torch.cuda.is_available() else "cpu"  # device to use
-        self.train_eps = 3000  # 训练的回合数
+        self.train_eps = 800  # 训练的回合数
         self.test_eps = 50  # 测试的回合数
         self.max_steps = 500  # 每个回合的最大步数
         self.eval_eps = 5  # 评估的回合数
@@ -44,13 +45,16 @@ class Config:
 
 def env_agent_config(cfg, MAT_FOLDER):
     # 加载不同的铣削环境
-    env = Milling_env(MAT_FOLDER)
+    env = Milling_env(MAT_FOLDER) # ppo
+    env = Milling_env_1125(MAT_FOLDER) # ppo_1125
+
+
     # env = MillingSLDEnv() # env2
     # env = MillingEnvLobe3(MAT_FOLDER)
     # env = Milling_env(MAT_FOLDER)
 
     # all_seed(env, seed=cfg.seed)
-    n_states = 4  # 状态空间维度
+    n_states = 5  # 状态空间维度
     n_actions = 1  # 动作空间维度
     print(f"状态空间维度：{n_states}，动作空间维度：{n_actions}")
 
@@ -75,7 +79,7 @@ def smooth(data, weight=0.9):
 
 def plot_rewards(rewards, cfg, tag="train"):
     """画图"""
-    sns.set_theme()
+    # sns.set_theme()
     plt.figure()  # 创建一个图形实例，方便同时多画几个图
     plt.title(f"{tag}ing curve on {cfg.device} of {cfg.algo_name} for {cfg.env_name}")
     plt.xlabel("epsiodes")
