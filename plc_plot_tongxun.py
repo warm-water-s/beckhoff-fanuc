@@ -334,70 +334,125 @@ class GUI():
             return None, None
 
 
-    # --- Override Control Functions (新增功能模块) ---
+    # ============================================================
+    # --- [核心接口] 供外部模型/算法调用的 API ---
+    # ============================================================
+    def api_set_feed_override(self, value: int):
+        """
+        [外部接口] 设置进给倍率
+        :param value: 整数, 范围 0-150
+        :return: Boolean (是否写入成功)
+        """
+        if not self.plc_conn or not self.plc_conn.is_open:
+            self.write_log_to_text("API调用失败: PLC未连接")
+            return False
+            
+        # 1. 范围限制
+        safe_value = max(0, min(150, int(value)))
+        
+        try:
+            # 2. 写入 PLC
+            self.plc_conn.write_by_name(VAR_CMD_FEED, safe_value, pyads.PLCTYPE_WORD)
+            
+            # 3. 同步更新 UI 输入框 (让操作员也能看到模型改了什么)
+            self.var_set_feed.set(str(safe_value))
+            
+            self.write_log_to_text(f"[API] 外部指令执行: 设定进给 -> {safe_value}%")
+            return True
+        except Exception as e:
+            self.write_log_to_text(f"[API] 进给写入异常: {e}")
+            return False
+
+    def api_set_spindle_override(self, value: int):
+        """
+        [外部接口] 设置主轴倍率
+        :param value: 整数, 范围 0-150
+        :return: Boolean
+        """
+        if not self.plc_conn or not self.plc_conn.is_open:
+            self.write_log_to_text("API调用失败: PLC未连接")
+            return False
+            
+        safe_value = max(0, min(150, int(value)))
+        
+        try:
+            self.plc_conn.write_by_name(VAR_CMD_SPINDLE, safe_value, pyads.PLCTYPE_WORD)
+            
+            # 同步更新 UI
+            self.var_set_spindle.set(str(safe_value))
+            
+            self.write_log_to_text(f"[API] 外部指令执行: 设定主轴 -> {safe_value}%")
+            return True
+        except Exception as e:
+            self.write_log_to_text(f"[API] 主轴写入异常: {e}")
+            return False
+
+    def api_set_control_enable(self, enable: bool):
+        """
+        [外部接口] 设置控制权限 (True=HMI接管, False=面板控制)
+        :param enable: Boolean
+        :return: Boolean
+        """
+        if not self.plc_conn or not self.plc_conn.is_open:
+            self.write_log_to_text("API调用失败: PLC未连接")
+            return False
+            
+        try:
+            # 1. 写入 PLC
+            self.plc_conn.write_by_name(VAR_CMD_ENABLE, enable, pyads.PLCTYPE_BOOL)
+            
+            # 2. 更新内部状态和 UI 按钮样式
+            self.is_override_enabled = enable
+            if self.is_override_enabled:
+                self.btn_enable_override.config(text="ON (HMI 接管)", bg="#00ff00")
+                self.write_log_to_text("[API] 外部指令: 权限已切换至 HMI")
+            else:
+                self.btn_enable_override.config(text="OFF (面板控制)", bg="gray")
+                self.write_log_to_text("[API] 外部指令: 权限已释放给机床面板")
+            return True
+        except Exception as e:
+            self.write_log_to_text(f"[API] 权限切换异常: {e}")
+            return False
+
+
+    # --- Override Control Functions---
+    # --- [UI 回调] 界面按钮点击事件 (内部调用 API) ---
+    # ============================================================
     def write_feed_override(self):
-        """写入进给倍率"""
+        """UI按钮: 写入进给倍率"""
         if not self.plc_conn or not self.plc_conn.is_open:
             messagebox.showwarning("警告", "请先连接PLC")
             return
-        
         try:
+            # 获取输入框的值
             val = int(self.var_set_feed.get())
-            if val < 0 or val > 150: # 假设最大150%
-                messagebox.showwarning("警告", "进给倍率超出范围 (0-150)")
-                return
-            
-            # 仅负责写入
-            self.plc_conn.write_by_name(VAR_CMD_FEED, val, pyads.PLCTYPE_WORD)
-            self.write_log_to_text(f"已写入进给倍率设定: {val}%")
+            # 调用 API
+            self.api_set_feed_override(val)
         except ValueError:
             messagebox.showerror("错误", "请输入有效的整数")
-        except Exception as e:
-            self.write_log_to_text(f"写入进给失败: {e}")
 
     def write_spindle_override(self):
-        """写入主轴倍率"""
+        """UI按钮: 写入主轴倍率"""
         if not self.plc_conn or not self.plc_conn.is_open:
             messagebox.showwarning("警告", "请先连接PLC")
             return
-        
         try:
             val = int(self.var_set_spindle.get())
-            if val < 0 or val > 150: 
-                messagebox.showwarning("警告", "主轴倍率超出范围 (0-150)")
-                return
-            
-            self.plc_conn.write_by_name(VAR_CMD_SPINDLE, val, pyads.PLCTYPE_WORD)
-            self.write_log_to_text(f"已写入主轴倍率设定: {val}%")
+            # 调用 API
+            self.api_set_spindle_override(val)
         except ValueError:
             messagebox.showerror("错误", "请输入有效的整数")
-        except Exception as e:
-            self.write_log_to_text(f"写入主轴失败: {e}")
 
     def toggle_override_enable(self):
-        """切换倍率使能状态 (OFF <-> ON)"""
+        """UI按钮: 切换使能状态"""
         if not self.plc_conn or not self.plc_conn.is_open:
             messagebox.showwarning("警告", "请先连接PLC")
             return
         
-        try:
-            # 切换状态
-            new_state = not self.is_override_enabled
-            
-            # 写入PLC
-            self.plc_conn.write_by_name(VAR_CMD_ENABLE, new_state, pyads.PLCTYPE_BOOL)
-            
-            # 更新本地状态和UI
-            self.is_override_enabled = new_state
-            if self.is_override_enabled:
-                self.btn_enable_override.config(text="ON (HMI 接管)", bg="#00ff00") # 绿色
-                self.write_log_to_text("倍率控制权: HMI接管")
-            else:
-                self.btn_enable_override.config(text="OFF (面板控制)", bg="gray") # 灰色
-                self.write_log_to_text("倍率控制权: 面板控制")
-                
-        except Exception as e:
-            self.write_log_to_text(f"切换使能失败: {e}")
+        # 翻转当前状态
+        target_state = not self.is_override_enabled
+        # 调用 API
+        self.api_set_control_enable(target_state)
 
     def update_override_status(self):
         """同步 PLC 当前的所有状态 (Act 和 Cmd)"""
@@ -599,7 +654,7 @@ class GUI():
         if not self.vib_x_history:
             messagebox.showwarning("提示", "当前没有波形数据，无法保存图片！")
             return
-            
+
         save_dir = "saved_images"
         if not os.path.exists(save_dir):
             os.makedirs(save_dir) # 如果文件夹不存在则创建
