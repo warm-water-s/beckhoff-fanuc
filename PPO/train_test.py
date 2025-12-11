@@ -24,7 +24,7 @@ def train(cfg, env, agent):
             ep_step += 1
             action, log_prob = agent.sample_action(state)  # 选择动作
             # 更新环境，返回transition
-            next_state, reward, done = env.step(state,action)
+            next_state, reward, done = env.step(state, action)
 
             agent.memory.push((state, action, log_prob, reward, done))  # 保存transition
             state = next_state  # 更新下一个状态
@@ -81,20 +81,57 @@ def test(cfg, env, agent):
     print("开始测试！")
     rewards = []  # 记录所有回合的奖励
     steps = []
+
+    # ============================================================
+    # 2：预先获取物理边界，用于后续打印
+    # ============================================================
+    # 检查是否是新的 3D 环境，如果是，获取物理范围
+    is_3d_env = hasattr(env, 'checker')
+    if is_3d_env:
+        n_min, n_max = env.checker.n_min, env.checker.n_max
+        # 注意：这里的切深范围是目标切深的范围，不是物理极限范围
+        # 因为我们主要关心 target_ap
+        ap_min, ap_max = env.ap_target_min, env.ap_target_max
+
     for i_ep in range(cfg.test_eps):
         ep_reward = 0  # 记录一回合内的奖励
         ep_step = 0
         state = env.reset()
+
+        # 打印当前回合的任务背景 (Context)
+        if is_3d_env:
+            print(f"\n[Episode {i_ep+1}] 任务目标 -> 切深: {env.target_ap:.3f} mm | 刚度: {env.current_stiff:.2e} | 频率: {env.current_freq:.1f} Hz")
+
+
         for t in range(cfg.max_steps):
             ep_step += 1
             action = agent.predict_action(state)  # 选择动作
             next_state, reward, done = env.step(state, action)
+
             if t % 10 == 0:
-                print(f"action:{action}\t ap:{state[0]:.5f}\t n:{state[2]:.5f}")
+                if is_3d_env:
+                    # state[0] 是归一化的转速
+                    n_norm = next_state[0]
+                    # 反归一化公式：Real = Norm * (Max - Min) + Min
+                    real_n = n_norm * (n_max - n_min) + n_min
+                    
+                    print(f"Step: {t:<3} | Action: {action[0]:.3f} | "
+                          f"实际转速: {real_n:.1f} r/min | "
+                          f"奖励: {reward:.3f}")
+                else:
+                    # 旧环境的打印逻辑
+                    print(f"action:{action}\t ap:{state[0]:.5f}\t n:{state[2]:.5f}")
+
             state = next_state  # 更新下一个状态
             ep_reward += reward  # 累加奖励
+
             if done:    
+                # 结束时再次打印最终状态
+                if is_3d_env:
+                    final_n = next_state[0] * (n_max - n_min) + n_min
+                    print(f"---> 回合结束. 最终转速: {final_n:.1f} r/min, 总奖励: {ep_reward:.2f}")
                 break
+            
         steps.append(ep_step)
         rewards.append(ep_reward)
         print(f"回合：{i_ep+1}/{cfg.test_eps}，奖励：{ep_reward:.2f}")

@@ -9,6 +9,7 @@ from PPO_Model.PPO import Agent, AgentGaussian
 
 from envs.milling_env_ppo import Milling_env
 from envs.milling_env_ppo_1125 import Milling_env_1125
+from envs.milling_env_ppo_1211 import Milling_env_1211
 
 # from envs.env2 import MillingSLDEnv
 # from envs.env_three_lobe import MillingEnvLobe3
@@ -44,9 +45,22 @@ class Config:
 
 
 def env_agent_config(cfg, MAT_FOLDER):
+    # ==========================================
+    # 修改点 1: 指定具体的 mat 文件路径，而不是文件夹
+    # ==========================================
+    # 假设你的 mat 文件在 folder 里面，或者直接传文件路径
+    if os.path.isdir(MAT_FOLDER):
+        mat_path = os.path.join(MAT_FOLDER, "leafmap_3D2.mat")
+    else:
+        mat_path = MAT_FOLDER
+        
+    print(f"Loading environment with MAT file: {mat_path}")
+    
+
     # 加载不同的铣削环境
-    env = Milling_env(MAT_FOLDER) # ppo
-    env = Milling_env_1125(MAT_FOLDER) # ppo_1125
+    # env = Milling_env(MAT_FOLDER) # ppo
+    # env = Milling_env_1125(MAT_FOLDER) # ppo_1125
+    env = Milling_env_1211(mat_path) # ppo_1211
 
 
     # env = MillingSLDEnv() # env2
@@ -54,7 +68,7 @@ def env_agent_config(cfg, MAT_FOLDER):
     # env = Milling_env(MAT_FOLDER)
 
     # all_seed(env, seed=cfg.seed)
-    n_states = 5  # 状态空间维度
+    n_states = 4  # 状态空间维度
     n_actions = 1  # 动作空间维度
     print(f"状态空间维度：{n_states}，动作空间维度：{n_actions}")
 
