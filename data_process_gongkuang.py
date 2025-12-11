@@ -19,6 +19,13 @@ ADS 数据采集、双特征工况识别与增量式保存系统
     ... (共 10 行电流数据)
     ===================================================
 """
+
+"""
+    待修改功能:
+        1、日志区对于周期与状态的更新太频繁了,最好一段时间更新一次
+        2、对于日志部分可以频繁的可以更新到文件中,显示部分仅显示当前状态，如果状态变化则改变，或者根据1修改
+
+"""
 import pyads
 import tkinter
 import time
@@ -50,8 +57,8 @@ DEFAULT_SAVE_PATH = "processed_sensor_log.txt"
 LOG_LINE_NUM = 0
 
 # ========== 工况识别配置 ==========
-DEFAULT_IDLE_THRESHOLD = "50"     # 电流低阈值：区分停转和运行 (原始INT RMS)
-DEFAULT_VIB_THRESHOLD = "2000"    # 振动高阈值：区分空转和切削 (原始INT RMS)
+DEFAULT_IDLE_THRESHOLD = "500"     # 电流低阈值：区分停转和运行 (原始INT RMS)
+DEFAULT_VIB_THRESHOLD = "320"    # 振动高阈值：区分空转和切削 (原始INT RMS)
 STABILITY_CHECK_COUNT = 5         # 连续多少个 10ms 周期判断为稳定状态切换 (50ms 延迟)
 # ============================================
 

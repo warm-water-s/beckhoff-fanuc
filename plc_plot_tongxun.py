@@ -39,8 +39,10 @@
     主要优化点:
     - 历史缓存点数计算逻辑修正: 确保 MAX_HISTORY_POINTS 对应 PLOT_HISTORY_LENGTH * (每周期实际采集点数)。
     - 代码结构优化: 将 MAX_HISTORY_POINTS 等基于配置的参数在 __init__ 中计算。
-    1、清除当前图形中的波形,以便于重新一次的采集
-    2、将历史数据绘制的波形图保存成图片
+    1. 增加 Cmd (设定值) 的回读显示。
+    2. 无论倍率是由 HMI 手动写入，还是由外部模块修改，界面均能实时同步显示 PLC 当前的设定值。
+    3. 清除当前图形中的波形,以便于重新一次的采集
+    4. 将历史数据绘制的波形图保存成图片
 """
 
 import pyads
@@ -79,6 +81,12 @@ INDEX_BUFFER_OFFSET = 16000
 INDEX_BUFFER_LENGTH = FULL_CHANNELS 
 INDEX_BUFFER_DATATYPE = pyads.PLCTYPE_INT
 
+# ADS 配置 (倍率控制变量名 - 对应 PLC GVL)
+VAR_CMD_FEED = "GVL.Gvl_Cmd_FeedRate_Set"         # WORD
+VAR_CMD_SPINDLE = "GVL.Gvl_Cmd_Spindle_Set"       # WORD
+VAR_CMD_ENABLE = "GVL.Gvl_Cmd_Enable_Override"    # BOOL
+VAR_ACT_FEED = "GVL.Gvl_Act_FeedRate_Real"        # WORD
+
 # 默认连接参数
 DEFAULT_AMS_NETID = "5.136.192.215.1.1"
 DEFAULT_PORT = "851"
@@ -100,11 +108,18 @@ class GUI():
         self.is_realtime_running = False
         self.sample_index = 0 # 用于电流趋势图的 x 轴点数计数 (累计)
         
-        # 修正历史缓存点数计算 (核心修正)
-        # 历史缓存点数 = PLOT_HISTORY_LENGTH * (每周期实际采集点数)
+        # 倍率控制相关变量
+        self.var_set_feed = tkinter.StringVar(value="100")
+        self.var_set_spindle = tkinter.StringVar(value="100")
+
+        # --- 显示变量 (从PLC回读) ---
+        self.var_act_feed_display = tkinter.StringVar(value="---")  # 实际进给(反馈)
+        self.var_cmd_feed_display = tkinter.StringVar(value="---")  # 当前设定进给(回读)
+        self.var_cmd_spindle_display = tkinter.StringVar(value="---") # 当前设定主轴(回读)
+
+        self.is_override_enabled = False # 本地标记使能状态
         
         # 振动历史数据缓存: 每周期 (100ms) 采集 10 个 1kHz 通道 = 1000 点
-        # MAX_VIB_HISTORY_POINTS = 周期数 * 1000 点
         self.MAX_VIB_HISTORY_POINTS = PLOT_HISTORY_LENGTH * VIBRATION_GROUP_SIZE * SAMPLE_COUNT 
         self.vib_x_history = [] 
         self.vib_y_history = []
@@ -126,12 +141,12 @@ class GUI():
         
         # ***布局优化：调整 grid 权重***
         self.init_windows_name.grid_columnconfigure(2, weight=1) 
-        for i in range(4): self.init_windows_name.grid_rowconfigure(i, weight=1) 
+        for i in range(5): self.init_windows_name.grid_rowconfigure(i, weight=1) 
         
         # 1. ========== 左侧：主容器 Frame ==========
         self.left_frame = tkinter.Frame(self.init_windows_name)
-        self.left_frame.grid(row=0, column=0, columnspan=2, rowspan=4, padx=10, pady=5, sticky="nsew")
-        self.left_frame.grid_rowconfigure(4, weight=1) 
+        self.left_frame.grid(row=0, column=0, columnspan=2, rowspan=5, padx=10, pady=5, sticky="nsew")
+        self.left_frame.grid_rowconfigure(5, weight=1) 
         
         # 2. ========== 左侧：操作控制栏 (简化结构) ==========
         
@@ -168,9 +183,44 @@ class GUI():
         self.stop_read_button = tkinter.Button(frame_data, text='停止实时监测', command=self.stop_realtime_monitor, state=tkinter.DISABLED)
         self.stop_read_button.grid(row=2, column=1, pady=5, sticky="ew")
 
-        # 2.3. 文件/维护操作组 (Row 2) 
+
+        # 2.3. *** 新增：机床倍率控制组 (Row 2) ***
+        frame_override = tkinter.LabelFrame(self.left_frame, text="机床倍率控制", padx=5, pady=5, fg="blue")
+        frame_override.grid(row=2, column=0, columnspan=2, pady=5, sticky="ew")
+        
+        # --- 进给倍率 ---
+        tkinter.Label(frame_override, text="设定进给:").grid(row=0, column=0, sticky="w", pady=2)
+        tkinter.Entry(frame_override, textvariable=self.var_set_feed, width=6).grid(row=0, column=1, pady=2)
+        tkinter.Button(frame_override, text="写入", command=self.write_feed_override, width=4).grid(row=0, column=2, padx=2)
+        # 回读显示
+        tkinter.Label(frame_override, text="PLC当前:").grid(row=0, column=3, padx=(10,0))
+        tkinter.Label(frame_override, textvariable=self.var_cmd_feed_display, fg="blue", font=("Arial", 10, "bold")).grid(row=0, column=4, sticky="w")
+        tkinter.Label(frame_override, text="%").grid(row=0, column=5)
+
+        # --- 主轴倍率 ---
+        tkinter.Label(frame_override, text="设定主轴:").grid(row=1, column=0, sticky="w", pady=2)
+        tkinter.Entry(frame_override, textvariable=self.var_set_spindle, width=6).grid(row=1, column=1, pady=2)
+        tkinter.Button(frame_override, text="写入", command=self.write_spindle_override, width=4).grid(row=1, column=2, padx=2)
+        # 回读显示
+        tkinter.Label(frame_override, text="PLC当前:").grid(row=1, column=3, padx=(10,0))
+        tkinter.Label(frame_override, textvariable=self.var_cmd_spindle_display, fg="blue", font=("Arial", 10, "bold")).grid(row=1, column=4, sticky="w")
+        tkinter.Label(frame_override, text="%").grid(row=1, column=5)
+
+        # --- 实际反馈 (只读) ---
+        tkinter.Label(frame_override, text="--------------------------------").grid(row=2, column=0, columnspan=6)
+        tkinter.Label(frame_override, text="机床实际执行进给:").grid(row=3, column=0, columnspan=3, sticky="w")
+        self.lbl_act_feed = tkinter.Label(frame_override, textvariable=self.var_act_feed_display, fg="red", font=("Arial", 12, "bold"))
+        self.lbl_act_feed.grid(row=3, column=3, columnspan=2, sticky="w")
+        tkinter.Label(frame_override, text="%").grid(row=3, column=5, sticky="w")
+
+        # --- 使能控制 ---
+        tkinter.Label(frame_override, text="控制权限:").grid(row=4, column=0, sticky="w", pady=5)
+        self.btn_enable_override = tkinter.Button(frame_override, text="OFF (面板控制)", bg="gray", command=self.toggle_override_enable, width=15)
+        self.btn_enable_override.grid(row=4, column=1, columnspan=4, pady=5)
+        
+        # 2.4. 文件/维护操作组 (Row 3) 
         frame_file = tkinter.LabelFrame(self.left_frame, text="文件/维护", padx=5, pady=5)
-        frame_file.grid(row=2, column=0, columnspan=2, pady=5, sticky="ew") 
+        frame_file.grid(row=3, column=0, columnspan=2, pady=5, sticky="ew") 
         
         tkinter.Label(frame_file, text='保存路径').grid(row=0, column=0, padx=5, pady=2, sticky="w")
         self.save_path_entry = tkinter.Entry(frame_file, textvariable=self.save_path, width=25)
@@ -186,10 +236,10 @@ class GUI():
         self.btn_save_images = tkinter.Button(frame_file, text='保存当前波形图 (截图)', command=self.save_figures_to_image, bg="#ADD8E6") # 淡蓝色
         self.btn_save_images.grid(row=2, column=0, columnspan=2, pady=5, sticky="ew")
 
-        # 2.4. ***系统日志区 (Row 3, 4)***
+        # 2.5. ***系统日志区 (Row 4, 5)***
         tkinter.Label(self.left_frame, text='系统日志').grid(row=3, column=0, columnspan=2, pady=(5, 0), sticky="sw")
         self.log_text = tkinter.Text(self.left_frame, width=35, height=10) 
-        self.log_text.grid(row=4, column=0, columnspan=2, pady=5, sticky="nsew")
+        self.log_text.grid(row=5, column=0, columnspan=2, pady=5, sticky="nsew")
 
 
         # 3. ========== 右侧：绘图展示主区 ==========
@@ -244,6 +294,7 @@ class GUI():
         LOG_LINE_NUM = 0
         self.write_log_to_text('日志已清空')
 
+
     # --- PLC Connection & Read ---
     def plc_port_open(self):
         """打开ADS端口并连接到PLC"""
@@ -274,15 +325,102 @@ class GUI():
 
         try:
             raw_data = self.plc_conn.read(
-                GVL_BUFFER_GROUP, GVL_BUFFER_OFFSET, GVL_BUFFER_DATATYPE * FULL_BUFFER_LENGTH
-            )
+                GVL_BUFFER_GROUP, GVL_BUFFER_OFFSET, GVL_BUFFER_DATATYPE * FULL_BUFFER_LENGTH)
             index_data = self.plc_conn.read(
-                GVL_BUFFER_GROUP, INDEX_BUFFER_OFFSET, INDEX_BUFFER_DATATYPE * INDEX_BUFFER_LENGTH
-            )
+                GVL_BUFFER_GROUP, INDEX_BUFFER_OFFSET, INDEX_BUFFER_DATATYPE * INDEX_BUFFER_LENGTH)
             return raw_data, index_data
         except Exception as e:
             self.write_log_to_text(f'原子读取失败: {str(e)}')
             return None, None
+
+
+    # --- Override Control Functions (新增功能模块) ---
+    def write_feed_override(self):
+        """写入进给倍率"""
+        if not self.plc_conn or not self.plc_conn.is_open:
+            messagebox.showwarning("警告", "请先连接PLC")
+            return
+        
+        try:
+            val = int(self.var_set_feed.get())
+            if val < 0 or val > 150: # 假设最大150%
+                messagebox.showwarning("警告", "进给倍率超出范围 (0-150)")
+                return
+            
+            # 仅负责写入
+            self.plc_conn.write_by_name(VAR_CMD_FEED, val, pyads.PLCTYPE_WORD)
+            self.write_log_to_text(f"已写入进给倍率设定: {val}%")
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的整数")
+        except Exception as e:
+            self.write_log_to_text(f"写入进给失败: {e}")
+
+    def write_spindle_override(self):
+        """写入主轴倍率"""
+        if not self.plc_conn or not self.plc_conn.is_open:
+            messagebox.showwarning("警告", "请先连接PLC")
+            return
+        
+        try:
+            val = int(self.var_set_spindle.get())
+            if val < 0 or val > 150: 
+                messagebox.showwarning("警告", "主轴倍率超出范围 (0-150)")
+                return
+            
+            self.plc_conn.write_by_name(VAR_CMD_SPINDLE, val, pyads.PLCTYPE_WORD)
+            self.write_log_to_text(f"已写入主轴倍率设定: {val}%")
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的整数")
+        except Exception as e:
+            self.write_log_to_text(f"写入主轴失败: {e}")
+
+    def toggle_override_enable(self):
+        """切换倍率使能状态 (OFF <-> ON)"""
+        if not self.plc_conn or not self.plc_conn.is_open:
+            messagebox.showwarning("警告", "请先连接PLC")
+            return
+        
+        try:
+            # 切换状态
+            new_state = not self.is_override_enabled
+            
+            # 写入PLC
+            self.plc_conn.write_by_name(VAR_CMD_ENABLE, new_state, pyads.PLCTYPE_BOOL)
+            
+            # 更新本地状态和UI
+            self.is_override_enabled = new_state
+            if self.is_override_enabled:
+                self.btn_enable_override.config(text="ON (HMI 接管)", bg="#00ff00") # 绿色
+                self.write_log_to_text("倍率控制权: HMI接管")
+            else:
+                self.btn_enable_override.config(text="OFF (面板控制)", bg="gray") # 灰色
+                self.write_log_to_text("倍率控制权: 面板控制")
+                
+        except Exception as e:
+            self.write_log_to_text(f"切换使能失败: {e}")
+
+    def update_override_status(self):
+        """同步 PLC 当前的所有状态 (Act 和 Cmd)"""
+        if not self.plc_conn or not self.plc_conn.is_open:
+            return
+        
+        try:
+            # 1. 读取实际反馈 (Actual)
+            act_feed = self.plc_conn.read_by_name(VAR_ACT_FEED, pyads.PLCTYPE_WORD)
+            self.var_act_feed_display.set(str(act_feed))
+
+            # 2. 读取当前设定 (Command) - 这实现了"实时显示外部传入的倍率"
+            cmd_feed = self.plc_conn.read_by_name(VAR_CMD_FEED, pyads.PLCTYPE_WORD)
+            self.var_cmd_feed_display.set(str(cmd_feed))
+
+            cmd_spindle = self.plc_conn.read_by_name(VAR_CMD_SPINDLE, pyads.PLCTYPE_WORD)
+            self.var_cmd_spindle_display.set(str(cmd_spindle))
+            
+            # 3. 同步使能状态: 如果你也希望外部能修改 Enable 位，这里也可以增加读取 Logic
+            curr_enable = self.plc_conn.read_by_name(VAR_CMD_ENABLE, pyads.PLCTYPE_BOOL)
+
+        except Exception:
+            pass
 
 
     # --- Data Processing (核心逻辑) ---
@@ -450,18 +588,18 @@ class GUI():
         except Exception as e:
             self.write_log_to_text(f'文件保存失败: {str(e)}')
 
-    # --- 辅助功能：生成文件名时间戳、保存图片、重置绘图 ---
+    # --- 【新增2】辅助功能：生成文件名时间戳、保存图片、重置绘图 ---
     def get_timestamp_for_filename(self):
         """生成用于文件名的纯数字时间戳 (如: 20231211_103000)"""
         return time.strftime('%Y%m%d_%H%M%S', time.localtime(time.time()))
 
     def save_figures_to_image(self):
         """将当前两个绘图区域保存为PNG图片"""
-        # === 【新增】空数据检查 ===
+        # === 空数据检查 ===
         if not self.vib_x_history:
             messagebox.showwarning("提示", "当前没有波形数据，无法保存图片！")
             return
-
+            
         save_dir = "saved_images"
         if not os.path.exists(save_dir):
             os.makedirs(save_dir) # 如果文件夹不存在则创建
@@ -620,7 +758,6 @@ class GUI():
         self.fig_current.tight_layout()
         self.canvas_current.draw()
 
-
     # --- Realtime Control ---
     def read_data_once(self):
         """单次读取数据并更新图表和文件"""
@@ -652,8 +789,8 @@ class GUI():
             self.write_log_to_text('请先打开PLC端口')
             return
 
-        # --- 启动前清空旧图 ---
-        self.reset_and_clear_plots()
+        # --- 【新增3】启动前清空旧图 ---
+        self.reset_and_clear_plots() 
 
         self.is_realtime_running = True
         self.realtime_read_button.config(state=tkinter.DISABLED)
@@ -684,6 +821,9 @@ class GUI():
             except ValueError:
                 interval = int(DEFAULT_INTERVAL_MS)
                 self.write_log_to_text('读取间隔输入无效，已恢复默认值。')
+            
+            # 确保在实时监测时，界面上的倍率回读值也能实时跳变
+            self.update_override_status()
             
             raw_data, index_data = self._read_data_atomic()
             if raw_data is None:
