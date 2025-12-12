@@ -1,0 +1,119 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="PLC_FB" Id="{ab0abb7e-ed83-4c19-834c-c8ebb50959bd}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK PLC_FB
+VAR_INPUT
+	PlcDataAll: ARRAY[1..80] OF INT;    //80模拟量采集通道	
+	// === 上位机指令 ===
+    Cmd_FeedRate     : WORD;  //设定进给倍率
+    Cmd_SpindleSpeed : WORD;  //设定主轴转速倍率
+    Cmd_Enable       : BOOL;  // 接收上位机的使能信号
+	
+	// === 硬件原始输入 ===
+    RawFeedRead_Gray : BYTE;
+END_VAR
+
+VAR_OUTPUT
+	PlcBuffer: ARRAY[1..8000] OF INT;    // 80×100 环形缓存
+	IndexBuffer: ARRAY[1..80] OF INT;    // 每路内部的 1-based 写指针（1~100）
+	
+	Act_FeedRate     : WORD;  
+    // === 硬件输出 ===
+    OutFeedWrite_Gray    : BYTE;
+    OutSpindleWrite_Gray : BYTE;
+    OutOverrideValid     : BOOL; 
+END_VAR
+
+VAR
+    {* 循环/计算用局部变量 *}
+    i      : INT;      // 循环计数（1..80）
+	
+    tempBin  : BYTE;
+    TargetFeedBin    : WORD;
+    TargetSpindleBin : WORD;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[//***********模拟量存入缓存区 BEGIN***********//
+{* ============  80 路环形缓存  ============ *}
+FOR i := 1 TO 80 DO
+    // 确保指针有效
+    IF IndexBuffer[i] < 1 THEN
+        IndexBuffer[i] := 1;
+    ELSIF IndexBuffer[i] > 100 THEN
+        IndexBuffer[i] := 1;
+    END_IF;
+
+    // 写入：本路基地址 + 偏移
+    PlcBuffer[(i - 1) * 100 + IndexBuffer[i]] := PlcDataAll[i];
+
+    // 更新指针
+    IndexBuffer[i] := IndexBuffer[i] + 1;
+    IF IndexBuffer[i] > 100 THEN
+        IndexBuffer[i] := 1;
+    END_IF;
+END_FOR;
+{* ============  环形缓存结束  ============ *}
+//***********模拟量存入缓存区 END***********//
+
+
+//=========================================================
+// 2. 倍率读取逻辑 (EL1018 -> 取反解码 -> 上位机)
+//=========================================================
+// 【修改点】既然验证了 0%=255, 200%=55，说明是二进制取反逻辑
+// 使用 NOT 指令直接还原真实值
+tempBin := NOT RawFeedRead_Gray;
+
+// B. 根据是否使能，决定反馈给上位机显示什么值
+IF Cmd_Enable THEN
+    // 情况1：PLC接管时，反馈“设定值”，保证界面显示稳定
+    Act_FeedRate := Cmd_FeedRate;
+ELSE
+    // 情况2：面板控制时，反馈“硬件读取值”
+    Act_FeedRate := BYTE_TO_WORD(tempBin);
+END_IF;
+
+// 【注意】原代码这里有一句重复赋值导致逻辑覆盖，已删除
+
+
+//=========================================================
+// 3. 倍率写入逻辑 (PLC -> 取反编码 -> EL2008)
+//=========================================================
+TargetFeedBin    := Cmd_FeedRate;
+TargetSpindleBin := Cmd_SpindleSpeed;
+
+// -- 进给倍率写入 --
+// 限制最大值防止溢出 (根据你测得的 200% = 200，这里最大可以放宽，但Byte上限是255)
+IF TargetFeedBin > 255 THEN TargetFeedBin := 255; END_IF;
+
+// 【修改点】既然输入是反码，输出给机床也必须是反码
+// 例如：设定 100 (01100100) -> 发送 NOT -> 155 (10011011)
+OutFeedWrite_Gray := NOT WORD_TO_BYTE(TargetFeedBin);
+
+
+// -- 主轴倍率写入 --
+// 【注意】假设主轴倍率开关原理和进给一样，也改为取反逻辑
+// 如果主轴读数不对，请改回原来的格雷码逻辑
+IF TargetSpindleBin > 255 THEN TargetSpindleBin := 255; END_IF;
+OutSpindleWrite_Gray := NOT WORD_TO_BYTE(TargetSpindleBin);
+
+
+//=========================================================
+// 4. 有效位控制逻辑
+//=========================================================
+// 只有当上位机置位 Cmd_Enable 为 TRUE 时，硬件输出才生效
+OutOverrideValid := Cmd_Enable;]]></ST>
+    </Implementation>
+    <LineIds Name="PLC_FB">
+      <LineId Id="361" Count="0" />
+      <LineId Id="885" Count="0" />
+      <LineId Id="944" Count="15" />
+      <LineId Id="898" Count="0" />
+      <LineId Id="370" Count="1" />
+      <LineId Id="1131" Count="0" />
+      <LineId Id="997" Count="0" />
+      <LineId Id="1086" Count="44" />
+      <LineId Id="1065" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

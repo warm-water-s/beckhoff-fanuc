@@ -1,0 +1,46 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="MAIN" Id="{db0c4132-3096-48dc-8c70-9b713eb4aa34}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM MAIN
+VAR
+	plc_fb:PLC_FB;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[plc_fb
+(
+	//功能块输入参数
+	PlcDataAll:=GVL.GvlDataAll,
+    //功能块输出参数
+	PlcBuffer=>Gvl.GvlBuffer,
+	IndexBuffer=>Gvl.GvlIndexBuffer,
+	
+	// === 交互部分 ===
+    Cmd_FeedRate     := GVL.Gvl_Cmd_FeedRate_Set,
+    Cmd_SpindleSpeed := GVL.Gvl_Cmd_Spindle_Set,
+    
+    // 【新增】绑定上位机使能信号
+    Cmd_Enable       := GVL.Gvl_Cmd_Enable_Override, 
+    
+    Act_FeedRate     => GVL.Gvl_Act_FeedRate_Real,
+    
+    // === 硬件IO部分 ===
+    RawFeedRead_Gray     := GVL.Gvl_EL1018_FeedRead_Gray,
+    OutFeedWrite_Gray    => GVL.Gvl_EL2008_FeedWrite_Gray,
+    OutSpindleWrite_Gray => GVL.Gvl_EL2008_SpindleWrite_Gray,
+    
+    // 【修改】硬件有效位现在由 FB 的逻辑决定
+    OutOverrideValid     => GVL.Gvl_Override_Valid
+
+);]]></ST>
+    </Implementation>
+    <LineIds Name="MAIN">
+      <LineId Id="69" Count="3" />
+      <LineId Id="78" Count="2" />
+      <LineId Id="87" Count="0" />
+      <LineId Id="89" Count="14" />
+      <LineId Id="88" Count="0" />
+      <LineId Id="83" Count="0" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

@@ -1,0 +1,49 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <GVL Name="GVL" Id="{210ddeb6-0e90-4eb5-bbde-2a912955ba72}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+VAR_GLOBAL
+	//================ 模拟量采集缓存 (核心业务) ================
+	//硬件绑定变量     包含：2×EL3632振动模块 + 1×EL3104电流模块 + 其他模拟量输入
+	//预定义80个INT数组，其中2个3632最多占用22个，3104占用4个
+	GvlDataAll   AT%I*: ARRAY[1..80] OF INT;
+
+	//缓存区变量
+	//把 80 路模拟量（每路 100 个采样点）全缓存下来，方便做平均、滤波、FFT、包络等后处理
+	GvlBuffer    AT%MB0: ARRAY[1..8000] OF INT;         //80通道模拟量缓存
+	//16000 字节之后放 80 个 INT，用来记录“每一路当前写到了第几个采样
+	//相当于 80 个“指针”，告诉程序每一路下一次该往 GvlBuffer 的哪个位置写新数据
+	GvlIndexBuffer AT%MB16000: ARRAY[1..80] OF INT;  //数据索引
+	
+	
+	//================ 上位机交互信号 (使用明确命名) ================
+    // 进给倍率 (0-150%)
+    Gvl_Cmd_FeedRate_Set    AT%I* : WORD; 
+    
+    // 主轴倍率 (0-120%)
+    Gvl_Cmd_Spindle_Set     AT%I* : WORD;
+    
+    // [输出] 反馈给上位机的状态 (Actual)
+    // 当前实际进给倍率 (EL1018读取并解码后的值)
+    Gvl_Act_FeedRate_Real   AT%Q* : WORD;
+	
+	// 上位机决定是否启用倍率接管
+    // TRUE = PLC接管机床倍率; FALSE = 机床使用自身面板倍率
+    Gvl_Cmd_Enable_Override AT%I* : BOOL;
+
+    //================ 硬件 I/O 映射 (倍率控制) ================
+    // [输入] EL1018 读取机床当前的进给倍率波段 (原始格雷码)
+    Gvl_EL1018_FeedRead_Gray AT%IB210 : BYTE; 
+
+    // [输出] EL2008_1 向机床写入进给倍率 (转换后的格雷码)
+    Gvl_EL2008_FeedWrite_Gray AT%QB71 : BYTE;
+
+    // [输出] EL2008_2 向机床写入主轴倍率 (转换后的格雷码)
+    Gvl_EL2008_SpindleWrite_Gray AT%QB72 : BYTE;
+
+    // [输出] 倍率有效信号
+    Gvl_Override_Valid AT%QX73.0 : BOOL;
+	
+END_VAR]]></Declaration>
+  </GVL>
+</TcPlcObject>
